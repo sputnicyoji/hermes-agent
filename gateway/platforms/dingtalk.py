@@ -48,7 +48,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
-    cache_image_from_bytes,
+    cache_image_from_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -297,47 +297,43 @@ class DingTalkAdapter(BasePlatformAdapter):
         Returns a `(media_urls, media_types)` pair. Empty on any failure
         — callers fall back to the `[图片]` text placeholder.
         """
-        if self._handler is None or self._http_client is None:
+        if self._handler is None:
             return [], []
         try:
-            codes = message.get_image_list() or []
-        except Exception:
+            codes = [c for c in (message.get_image_list() or []) if c]
+        except AttributeError:
             logger.exception("[%s] get_image_list failed", self.name)
             return [], []
         if not codes:
             return [], []
 
-        paths: List[str] = []
-        types: List[str] = []
-        for code in codes:
-            if not code:
-                continue
-            try:
-                # SDK method is sync (requests-based); offload to a thread.
-                download_url = await asyncio.to_thread(
-                    self._handler.get_image_download_url, code
-                )
-            except Exception:
-                logger.exception("[%s] get_image_download_url failed", self.name)
-                continue
-            if not download_url:
-                logger.warning(
-                    "[%s] No downloadUrl returned for code %s…",
-                    self.name, code[:16],
-                )
-                continue
-            try:
-                resp = await self._http_client.get(download_url, timeout=30.0)
-                resp.raise_for_status()
-                cached = cache_image_from_bytes(resp.content, ext=".jpg")
-            except Exception:
-                logger.exception("[%s] Picture fetch failed for %s",
-                                 self.name, download_url[:80])
-                continue
-            paths.append(cached)
-            types.append("image/jpeg")
-            logger.info("[%s] Cached inbound picture at %s", self.name, cached)
-        return paths, types
+        paths = [p for p in await asyncio.gather(*(self._fetch_one(c) for c in codes)) if p]
+        if paths:
+            logger.info("[%s] Cached %d inbound picture(s)", self.name, len(paths))
+        return paths, ["image/jpeg"] * len(paths)
+
+    async def _fetch_one(self, code: str) -> Optional[str]:
+        """Exchange one downloadCode for a cached local path.
+
+        SDK's `get_image_download_url` is sync (requests-based) — offloaded
+        to a thread so a slow token refresh doesn't stall the event loop.
+        `cache_image_from_url` handles retries + SSRF guarding.
+        """
+        try:
+            download_url = await asyncio.to_thread(
+                self._handler.get_image_download_url, code
+            )
+        except Exception:
+            logger.exception("[%s] get_image_download_url failed", self.name)
+            return None
+        if not download_url:
+            logger.warning("[%s] No downloadUrl for code %s…", self.name, code[:16])
+            return None
+        try:
+            return await cache_image_from_url(download_url, ext=".jpg")
+        except (httpx.HTTPError, ValueError) as e:
+            logger.warning("[%s] Picture cache failed: %s", self.name, e)
+            return None
 
     @staticmethod
     def _extract_text(message: "ChatbotMessage", msgtype: Optional[str] = None) -> str:
