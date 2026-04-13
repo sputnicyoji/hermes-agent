@@ -274,19 +274,18 @@ def kill_gateway_processes(force: bool = False, exclude_pids: set | None = None,
     """
     pids = find_gateway_pids(exclude_pids=exclude_pids, all_profiles=all_profiles)
     killed = 0
-    
+
     for pid in pids:
         try:
             terminate_pid(pid, force=force)
             killed += 1
         except ProcessLookupError:
-            # Process already gone
             pass
         except PermissionError:
             print(f"⚠ Permission denied to kill PID {pid}")
-    
         except OSError as exc:
             print(f"Failed to kill PID {pid}: {exc}")
+
     return killed
 
 
@@ -298,7 +297,7 @@ def stop_profile_gateway() -> bool:
     Returns True if a process was stopped, False if none was found.
     """
     try:
-        from gateway.status import get_running_pid, remove_pid_file
+        from gateway.status import get_running_pid, remove_pid_file, is_process_alive
     except ImportError:
         return False
 
@@ -317,11 +316,9 @@ def stop_profile_gateway() -> bool:
     # Wait briefly for it to exit
     import time as _time
     for _ in range(20):
-        try:
-            os.kill(pid, 0)
-            _time.sleep(0.5)
-        except (ProcessLookupError, PermissionError):
+        if not is_process_alive(pid):
             break
+        _time.sleep(0.5)
 
     remove_pid_file()
     return True

@@ -194,44 +194,37 @@ class TestWaitForGatewayExit:
         gateway._wait_for_gateway_exit(timeout=1.0, force_after=0.5)
 
     def test_returns_when_process_exits_gracefully(self, monkeypatch):
-        """Process exits after a couple of polls — no SIGKILL needed."""
-        poll_count = 0
+        # _wait_for_gateway_exit polls get_running_pid() each tick; it
+        # returns as soon as the PID file clears (the gateway shut down).
+        pid_calls = 0
 
-        def mock_get_running_pid():
-            nonlocal poll_count
-            poll_count += 1
-            return 12345 if poll_count <= 2 else None
+        def mock_get_pid():
+            nonlocal pid_calls
+            pid_calls += 1
+            return 12345 if pid_calls <= 2 else None
 
-        monkeypatch.setattr("gateway.status.get_running_pid", mock_get_running_pid)
+        monkeypatch.setattr("gateway.status.get_running_pid", mock_get_pid)
         monkeypatch.setattr("time.sleep", lambda _: None)
 
         gateway._wait_for_gateway_exit(timeout=10.0, force_after=999.0)
-        # Should have polled until None was returned.
-        assert poll_count == 3
+        assert pid_calls == 3
 
     def test_force_kills_after_grace_period(self, monkeypatch):
         """When the process doesn't exit, force-kill the saved PID."""
 
-        # Simulate monotonic time advancing past force_after
         call_num = 0
         def fake_monotonic():
             nonlocal call_num
             call_num += 1
-            # First two calls: initial deadline + force_deadline setup (time 0)
-            # Then each loop iteration advances time
-            return call_num * 2.0  # 2, 4, 6, 8, ...
+            return call_num * 2.0
 
         kills = []
         def mock_terminate(pid, force=False):
             kills.append((pid, force))
 
-        # get_running_pid returns the PID until kill is sent, then None
-        def mock_get_running_pid():
-            return None if kills else 42
-
         monkeypatch.setattr("time.monotonic", fake_monotonic)
         monkeypatch.setattr("time.sleep", lambda _: None)
-        monkeypatch.setattr("gateway.status.get_running_pid", mock_get_running_pid)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 42)
         monkeypatch.setattr(gateway, "terminate_pid", mock_terminate)
 
         gateway._wait_for_gateway_exit(timeout=10.0, force_after=5.0)
@@ -254,7 +247,6 @@ class TestWaitForGatewayExit:
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: 99)
         monkeypatch.setattr(gateway, "terminate_pid", mock_terminate)
 
-        # Should not raise — ProcessLookupError means it's already gone.
         gateway._wait_for_gateway_exit(timeout=10.0, force_after=2.0)
 
     def test_kill_gateway_processes_force_uses_helper(self, monkeypatch):

@@ -2237,16 +2237,15 @@ def _kill_orphaned_mcp_children() -> None:
 
     Only kills PIDs tracked in ``_stdio_pids`` — never arbitrary children.
     """
-    import signal as _signal
-    kill_signal = getattr(_signal, "SIGKILL", _signal.SIGTERM)
-
     with _lock:
         pids = list(_stdio_pids)
         _stdio_pids.clear()
 
+    from gateway.status import terminate_pid
+
     for pid in pids:
         try:
-            os.kill(pid, kill_signal)
+            terminate_pid(pid, force=True)
             logger.debug("Force-killed orphaned MCP stdio process %d", pid)
         except (ProcessLookupError, PermissionError, OSError):
             pass  # Already exited or inaccessible
