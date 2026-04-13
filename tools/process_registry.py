@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
+from gateway.status import is_process_alive
 
 logger = logging.getLogger(__name__)
 
@@ -229,13 +230,7 @@ class ProcessRegistry:
     @staticmethod
     def _is_host_pid_alive(pid: Optional[int]) -> bool:
         """Best-effort liveness check for host-visible PIDs."""
-        if not pid:
-            return False
-        try:
-            os.kill(pid, 0)
-            return True
-        except (ProcessLookupError, PermissionError):
-            return False
+        return bool(pid) and is_process_alive(pid)
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Update recovered host-PID sessions when the underlying process has exited."""

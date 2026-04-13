@@ -28,6 +28,77 @@ _LOCKS_DIRNAME = "gateway-locks"
 _IS_WINDOWS = sys.platform == "win32"
 _UNSET = object()
 
+# Windows has no SIGKILL; os.kill(pid, SIGTERM) on Windows is already
+# implemented as TerminateProcess, so SIGTERM is the correct force-kill
+# signal on that platform.
+FORCE_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+if _IS_WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _STILL_ACTIVE = 259
+    _ERROR_ACCESS_DENIED = 5
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+
+
+def is_process_alive(pid: int) -> bool:
+    """Cross-platform PID existence check with no side effects.
+
+    Intentionally avoids ``os.kill(pid, 0)`` because CPython on Windows
+    implements that path as ``OpenProcess`` + ``TerminateProcess`` — i.e.
+    it terminates the matched process instead of just checking it.
+    """
+    if pid <= 0:
+        return False
+
+    if _IS_WINDOWS:
+        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # ACCESS_DENIED means the process exists but we lack permission;
+            # treat as alive so we don't clobber a valid gateway owned by
+            # another user. Any other error (notably INVALID_PARAMETER for a
+            # vanished PID) counts as dead.
+            return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+        try:
+            exit_code = wintypes.DWORD()
+            if not _kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == _STILL_ACTIVE
+        finally:
+            _kernel32.CloseHandle(handle)
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def force_kill(pid: int) -> None:
+    """SIGKILL (or equivalent) a PID, swallowing race losses.
+
+    Races with the target process exiting on its own — or Windows error
+    codes from a PID that vanished between check and kill — are treated as
+    success: the goal is "process is gone", not "we delivered the signal".
+    """
+    try:
+        os.kill(pid, FORCE_KILL_SIGNAL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
 
 def _get_pid_path() -> Path:
     """Return the path to the gateway PID file, respecting HERMES_HOME."""
@@ -302,9 +373,7 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
 
         stale = existing_pid is None
         if not stale:
-            try:
-                os.kill(existing_pid, 0)
-            except (ProcessLookupError, PermissionError):
+            if not is_process_alive(existing_pid):
                 stale = True
             else:
                 current_start = _get_process_start_time(existing_pid)
@@ -405,9 +474,7 @@ def get_running_pid() -> Optional[int]:
         remove_pid_file()
         return None
 
-    try:
-        os.kill(pid, 0)  # signal 0 = existence check, no actual signal sent
-    except (ProcessLookupError, PermissionError):
+    if not is_process_alive(pid):
         remove_pid_file()
         return None
 

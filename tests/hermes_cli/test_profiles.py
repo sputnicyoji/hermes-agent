@@ -799,24 +799,21 @@ class TestEdgeCases:
         assert default.skill_count == 0
 
     def test_gateway_running_check_with_pid_file(self, profile_env):
-        """Verify _check_gateway_running reads pid file and probes os.kill."""
         from hermes_cli.profiles import _check_gateway_running
         tmp_path = profile_env
         default_home = tmp_path / ".hermes"
 
-        # No pid file -> not running
         assert _check_gateway_running(default_home) is False
 
-        # Write a PID file with a JSON payload
         pid_file = default_home / "gateway.pid"
         pid_file.write_text(json.dumps({"pid": 99999}))
-
-        # os.kill(99999, 0) should raise ProcessLookupError -> not running
         assert _check_gateway_running(default_home) is False
 
-        # Mock os.kill to simulate a running process
-        with patch("os.kill", return_value=None):
-            assert _check_gateway_running(default_home) is True
+        # Use the test's own PID as a guaranteed-live target; this exercises
+        # the cross-platform is_process_alive path without patching os.kill
+        # (which wouldn't intercept the Windows ctypes OpenProcess branch).
+        pid_file.write_text(json.dumps({"pid": os.getpid()}))
+        assert _check_gateway_running(default_home) is True
 
     def test_gateway_running_check_plain_pid(self, profile_env):
         """Pid file containing just a number (legacy format)."""
@@ -824,10 +821,9 @@ class TestEdgeCases:
         tmp_path = profile_env
         default_home = tmp_path / ".hermes"
         pid_file = default_home / "gateway.pid"
-        pid_file.write_text("99999")
+        pid_file.write_text(str(os.getpid()))
 
-        with patch("os.kill", return_value=None):
-            assert _check_gateway_running(default_home) is True
+        assert _check_gateway_running(default_home) is True
 
     def test_profile_name_boundary_single_char(self):
         """Single alphanumeric character is valid."""
