@@ -466,3 +466,113 @@ class TestPlatformEnum:
 
     def test_dingtalk_in_platform_enum(self):
         assert Platform.DINGTALK.value == "dingtalk"
+
+
+# ---------------------------------------------------------------------------
+# Picture attachment download
+# ---------------------------------------------------------------------------
+
+class TestFetchPictureAttachments:
+    """Exercise the messageFiles/download flow via mocked SDK handler."""
+
+    @staticmethod
+    def _make_adapter(get_url_return, http_content=b"\xff\xd8\xffJPEG-like"):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        config = PlatformConfig(enabled=True, extra={"client_id": "x", "client_secret": "y"})
+        adapter = DingTalkAdapter(config)
+        handler = MagicMock()
+        handler.get_image_download_url = MagicMock(return_value=get_url_return)
+        adapter._handler = handler
+        http_resp = MagicMock()
+        http_resp.content = http_content
+        http_resp.raise_for_status = MagicMock()
+        http_client = MagicMock()
+        http_client.get = AsyncMock(return_value=http_resp)
+        adapter._http_client = http_client
+        return adapter, handler, http_client
+
+    def test_returns_empty_when_handler_missing(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True, extra={"client_id": "x", "client_secret": "y"}))
+        assert adapter._handler is None
+        msg = MagicMock()
+        msg.get_image_list.return_value = ["code1"]
+        urls, types = asyncio.run(adapter._fetch_picture_attachments(msg))
+        assert urls == [] and types == []
+
+    def test_downloads_and_caches_single_image(self):
+        adapter, handler, http_client = self._make_adapter("https://cdn.example/img.jpg")
+        msg = MagicMock()
+        msg.get_image_list.return_value = ["code1"]
+        with patch("gateway.platforms.dingtalk.cache_image_from_bytes", return_value="/tmp/cached.jpg") as cache_fn:
+            urls, types = asyncio.run(adapter._fetch_picture_attachments(msg))
+        assert urls == ["/tmp/cached.jpg"]
+        assert types == ["image/jpeg"]
+        handler.get_image_download_url.assert_called_once_with("code1")
+        http_client.get.assert_awaited_once()
+        cache_fn.assert_called_once()
+
+    def test_skips_codes_that_return_empty_url(self):
+        adapter, handler, http_client = self._make_adapter("")  # SDK returns "" on failure
+        msg = MagicMock()
+        msg.get_image_list.return_value = ["code1", "code2"]
+        urls, types = asyncio.run(adapter._fetch_picture_attachments(msg))
+        assert urls == [] and types == []
+        assert handler.get_image_download_url.call_count == 2
+        http_client.get.assert_not_called()
+
+    def test_continues_after_single_http_failure(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        config = PlatformConfig(enabled=True, extra={"client_id": "x", "client_secret": "y"})
+        adapter = DingTalkAdapter(config)
+        handler = MagicMock()
+        handler.get_image_download_url = MagicMock(side_effect=["https://cdn/a.jpg", "https://cdn/b.jpg"])
+        adapter._handler = handler
+
+        good_resp = MagicMock(); good_resp.content = b"img"; good_resp.raise_for_status = MagicMock()
+        http_client = MagicMock()
+        http_client.get = AsyncMock(side_effect=[Exception("network blip"), good_resp])
+        adapter._http_client = http_client
+
+        msg = MagicMock()
+        msg.get_image_list.return_value = ["c1", "c2"]
+        with patch("gateway.platforms.dingtalk.cache_image_from_bytes", return_value="/tmp/b.jpg"):
+            urls, types = asyncio.run(adapter._fetch_picture_attachments(msg))
+        # First failed, second succeeded — only one entry.
+        assert urls == ["/tmp/b.jpg"]
+        assert types == ["image/jpeg"]
+
+    def test_on_message_picture_populates_media_urls(self):
+        """End-to-end: picture msgtype flows through to MessageEvent.media_urls."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter, handler, _http = self._make_adapter("https://cdn.example/img.jpg")
+        handler.get_image_download_url.return_value = "https://cdn.example/img.jpg"
+
+        msg = MagicMock()
+        msg.message_id = "m1"
+        msg.message_type = "picture"
+        msg.conversation_id = "cid1"
+        msg.conversation_type = "2"
+        msg.sender_id = "s1"
+        msg.sender_nick = "Yoji"
+        msg.sender_staff_id = "yoji"
+        msg.conversation_title = "group"
+        msg.create_at = 1712_000_000_000
+        msg.session_webhook = None
+        msg.get_image_list.return_value = ["code1"]
+
+        captured = []
+        async def _capture(event):
+            captured.append(event)
+        adapter.handle_message = _capture
+
+        with patch("gateway.platforms.dingtalk.cache_image_from_bytes", return_value="/tmp/pic.jpg"):
+            asyncio.run(adapter._on_message(msg))
+
+        assert len(captured) == 1
+        ev = captured[0]
+        assert ev.media_urls == ["/tmp/pic.jpg"]
+        assert ev.media_types == ["image/jpeg"]
+        assert ev.text == "[图片 × 1]"
+        from gateway.platforms.base import MessageType
+        assert ev.message_type == MessageType.PHOTO

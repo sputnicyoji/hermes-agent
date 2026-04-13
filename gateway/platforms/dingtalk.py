@@ -25,7 +25,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import dingtalk_stream
@@ -49,6 +49,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_image_from_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,9 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._stream_client: Any = None
         self._stream_task: Optional[asyncio.Task] = None
         self._http_client: Optional["httpx.AsyncClient"] = None
+        # Registered callback handler — kept around so picture downloads can
+        # piggyback on the SDK's access-token plumbing.
+        self._handler: Any = None
 
         # Message deduplication
         self._dedup = MessageDeduplicator(max_size=1000)
@@ -128,6 +132,9 @@ class DingTalkAdapter(BasePlatformAdapter):
             self._stream_client.register_callback_handler(
                 dingtalk_stream.ChatbotMessage.TOPIC, handler
             )
+            # register_callback_handler wires `handler.dingtalk_client = self`,
+            # giving us access_token + credential for OpenAPI calls.
+            self._handler = handler
 
             self._stream_task = asyncio.create_task(
                 self._run_stream(), name=f"{self.name}-stream"
@@ -183,6 +190,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             self._http_client = None
 
         self._stream_client = None
+        self._handler = None
         self._session_webhooks.clear()
         self._chat_types.clear()
         self._dedup.clear()
@@ -250,6 +258,18 @@ class DingTalkAdapter(BasePlatformAdapter):
         except (ValueError, OSError, TypeError):
             timestamp = datetime.now(tz=timezone.utc)
 
+        # Download picture attachments so the vision model sees real bytes
+        # instead of the [图片] placeholder. Applies to both `picture` and
+        # `richText` msgtypes (richText can carry inline images).
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        if msgtype in (_MSGTYPE_PICTURE, _MSGTYPE_RICH_TEXT):
+            media_urls, media_types = await self._fetch_picture_attachments(message)
+            if media_urls and msgtype == _MSGTYPE_PICTURE:
+                # Swap the bare placeholder for a short caption so the agent
+                # knows to look at the attachment list.
+                text = f"[图片 × {len(media_urls)}]"
+
         event = MessageEvent(
             text=text,
             message_type=event_type,
@@ -257,11 +277,68 @@ class DingTalkAdapter(BasePlatformAdapter):
             message_id=msg_id,
             raw_message=message,
             timestamp=timestamp,
+            media_urls=media_urls,
+            media_types=media_types,
         )
 
         logger.debug("[%s] Message from %s in %s: %s",
                       self.name, sender_nick, chat_id[:20] if chat_id else "?", text[:50])
         await self.handle_message(event)
+
+    async def _fetch_picture_attachments(
+        self, message: "ChatbotMessage"
+    ) -> Tuple[List[str], List[str]]:
+        """Download every picture referenced by an inbound message.
+
+        Uses the SDK's `get_image_download_url` (sync) to exchange each
+        downloadCode for a short-lived CDN URL, then fetches the bytes
+        via the adapter's async httpx client and caches them locally so
+        the vision tool can read them as file paths.
+
+        Returns a `(media_urls, media_types)` pair. Empty on any failure
+        — callers fall back to the `[图片]` text placeholder.
+        """
+        if self._handler is None or self._http_client is None:
+            return [], []
+        try:
+            codes = message.get_image_list() or []
+        except Exception:
+            logger.exception("[%s] get_image_list failed", self.name)
+            return [], []
+        if not codes:
+            return [], []
+
+        paths: List[str] = []
+        types: List[str] = []
+        for code in codes:
+            if not code:
+                continue
+            try:
+                # SDK method is sync (requests-based); offload to a thread.
+                download_url = await asyncio.to_thread(
+                    self._handler.get_image_download_url, code
+                )
+            except Exception:
+                logger.exception("[%s] get_image_download_url failed", self.name)
+                continue
+            if not download_url:
+                logger.warning(
+                    "[%s] No downloadUrl returned for code %s…",
+                    self.name, code[:16],
+                )
+                continue
+            try:
+                resp = await self._http_client.get(download_url, timeout=30.0)
+                resp.raise_for_status()
+                cached = cache_image_from_bytes(resp.content, ext=".jpg")
+            except Exception:
+                logger.exception("[%s] Picture fetch failed for %s",
+                                 self.name, download_url[:80])
+                continue
+            paths.append(cached)
+            types.append("image/jpeg")
+            logger.info("[%s] Cached inbound picture at %s", self.name, cached)
+        return paths, types
 
     @staticmethod
     def _extract_text(message: "ChatbotMessage", msgtype: Optional[str] = None) -> str:
