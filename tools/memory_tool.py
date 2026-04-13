@@ -23,13 +23,22 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
-import fcntl
 import json
 import logging
 import os
 import re
 import tempfile
 from contextlib import contextmanager
+
+try:
+    import fcntl  # POSIX
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False
+    try:
+        import msvcrt  # Windows
+    except ImportError:
+        msvcrt = None  # type: ignore[assignment]
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
@@ -146,11 +155,20 @@ class MemoryStore:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = open(lock_path, "w")
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            if _HAS_FCNTL:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            elif msvcrt is not None:
+                # Windows: lock a single byte; blocks until available.
+                msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            fd.close()
+            try:
+                if _HAS_FCNTL:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                elif msvcrt is not None:
+                    msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+            finally:
+                fd.close()
 
     @staticmethod
     def _path_for(target: str) -> Path:
