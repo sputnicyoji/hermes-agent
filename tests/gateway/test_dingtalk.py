@@ -296,10 +296,10 @@ class TestOnMessageRouting:
             "text",
             text_content="hello",
             conversation_id="conv-cache",
-            session_webhook="https://cache.example/wh",
+            session_webhook="https://api.dingtalk.com/robot/sendBySession?sessionWebhookKey=cache",
         )
         await adapter._on_message(msg)
-        assert adapter._session_webhooks["conv-cache"] == "https://cache.example/wh"
+        assert adapter._session_webhooks["conv-cache"] == "https://api.dingtalk.com/robot/sendBySession?sessionWebhookKey=cache"
 
 
 # ---------------------------------------------------------------------------
