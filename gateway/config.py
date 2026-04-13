@@ -307,6 +307,9 @@ class GatewayConfig:
             # QQBot uses extra dict for app credentials
             elif platform == Platform.QQBOT and config.extra.get("app_id") and config.extra.get("client_secret"):
                 connected.append(platform)
+            # DingTalk uses extra dict for app credentials
+            elif platform == Platform.DINGTALK and config.extra.get("client_id"):
+                connected.append(platform)
         return connected
     
     def get_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
@@ -1093,6 +1096,30 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 platform=Platform.WEIXIN,
                 chat_id=weixin_home,
                 name=os.getenv("WEIXIN_HOME_CHANNEL_NAME", "Home"),
+            )
+
+    # DingTalk
+    dingtalk_client_id = os.getenv("DINGTALK_CLIENT_ID")
+    dingtalk_client_secret = os.getenv("DINGTALK_CLIENT_SECRET")
+    if dingtalk_client_id and dingtalk_client_secret:
+        if Platform.DINGTALK not in config.platforms:
+            config.platforms[Platform.DINGTALK] = PlatformConfig()
+        config.platforms[Platform.DINGTALK].enabled = True
+        config.platforms[Platform.DINGTALK].extra.update({
+            "client_id": dingtalk_client_id,
+            "client_secret": dingtalk_client_secret,
+        })
+        dingtalk_allowed_users = os.getenv("DINGTALK_ALLOWED_USERS", "")
+        if dingtalk_allowed_users:
+            config.platforms[Platform.DINGTALK].extra["allowed_users"] = [
+                u.strip() for u in dingtalk_allowed_users.split(",") if u.strip()
+            ]
+        dingtalk_home = os.getenv("DINGTALK_HOME_CHANNEL")
+        if dingtalk_home:
+            config.platforms[Platform.DINGTALK].home_channel = HomeChannel(
+                platform=Platform.DINGTALK,
+                chat_id=dingtalk_home,
+                name=os.getenv("DINGTALK_HOME_CHANNEL_NAME", "Home"),
             )
 
     # BlueBubbles (iMessage)
