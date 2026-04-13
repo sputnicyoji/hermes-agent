@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 20000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 _SESSION_WEBHOOKS_MAX = 500
-_DINGTALK_WEBHOOK_RE = re.compile(r'^https://api\.dingtalk\.com/')
+_DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:o?api)\.dingtalk\.com/')
 
 
 def check_dingtalk_requirements() -> bool:
@@ -92,6 +92,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(max_size=1000)
         # Map chat_id -> session_webhook for reply routing
         self._session_webhooks: Dict[str, str] = {}
+        # Map chat_id -> "group" | "dm" captured from the inbound event
+        self._chat_types: Dict[str, str] = {}
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -120,7 +122,9 @@ class DingTalkAdapter(BasePlatformAdapter):
                 dingtalk_stream.ChatbotMessage.TOPIC, handler
             )
 
-            self._stream_task = asyncio.create_task(self._run_stream())
+            self._stream_task = asyncio.create_task(
+                self._run_stream(), name=f"{self.name}-stream"
+            )
             self._mark_connected()
             logger.info("[%s] Connected via Stream Mode", self.name)
             return True
@@ -169,6 +173,7 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         self._stream_client = None
         self._session_webhooks.clear()
+        self._chat_types.clear()
         self._dedup.clear()
         logger.info("[%s] Disconnected", self.name)
 
@@ -197,16 +202,18 @@ class DingTalkAdapter(BasePlatformAdapter):
         chat_id = conversation_id or sender_id
         chat_type = "group" if is_group else "dm"
 
-        # Store session webhook for reply routing (validate origin to prevent SSRF)
+        # Store session webhook for reply routing (validate origin to prevent SSRF).
+        # Eviction is FIFO (insertion order), not true LRU — adequate because
+        # stale webhooks are harmless; only the most recent one is ever used.
         session_webhook = getattr(message, "session_webhook", None) or ""
         if session_webhook and chat_id and _DINGTALK_WEBHOOK_RE.match(session_webhook):
-            if len(self._session_webhooks) >= _SESSION_WEBHOOKS_MAX:
-                # Evict oldest entry to cap memory growth
+            if chat_id not in self._session_webhooks and len(self._session_webhooks) >= _SESSION_WEBHOOKS_MAX:
                 try:
                     self._session_webhooks.pop(next(iter(self._session_webhooks)))
                 except StopIteration:
                     pass
             self._session_webhooks[chat_id] = session_webhook
+            self._chat_types[chat_id] = chat_type
 
         source = self.build_source(
             chat_id=chat_id,
@@ -275,6 +282,11 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not self._http_client:
             return SendResult(success=False, error="HTTP client not initialized")
 
+        if len(content) > self.MAX_MESSAGE_LENGTH:
+            logger.warning(
+                "[%s] Message truncated from %d to %d chars",
+                self.name, len(content), self.MAX_MESSAGE_LENGTH,
+            )
         payload = {
             "msgtype": "markdown",
             "markdown": {"title": "Hermes", "text": content[:self.MAX_MESSAGE_LENGTH]},
@@ -299,7 +311,7 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic info about a DingTalk conversation."""
-        return {"name": chat_id, "type": "group" if "group" in chat_id.lower() else "dm"}
+        return {"name": chat_id, "type": self._chat_types.get(chat_id, "dm")}
 
 
 # ---------------------------------------------------------------------------
