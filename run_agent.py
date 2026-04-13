@@ -622,6 +622,14 @@ class AIAgent:
         self.verbose_logging = verbose_logging
         self.quiet_mode = quiet_mode
         self.ephemeral_system_prompt = ephemeral_system_prompt
+        # Identity override: injected into every user message to counteract
+        # upstream proxy-injected system prompts (e.g. OneHub/One-API presets).
+        # Configured via model.identity_override in config.yaml.
+        try:
+            from hermes_cli.config import load_config as _lc
+            self._identity_override = (_lc().get("model", {}).get("identity_override") or "").strip() or None
+        except Exception:
+            self._identity_override = None
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
         # Pluggable print function — CLI replaces this with _cprint so that
@@ -8013,6 +8021,12 @@ class AIAgent:
             # input token costs by ~75% on multi-turn conversations.
             if self._use_prompt_caching:
                 api_messages = apply_anthropic_cache_control(api_messages, cache_ttl=self._cache_ttl, native_anthropic=(self.api_mode == 'anthropic_messages'))
+
+            # Identity override: append as the LAST system message, closest
+            # to model output. This position has the strongest influence and
+            # can counteract upstream proxy-injected identity prompts.
+            if getattr(self, "_identity_override", None):
+                api_messages.append({"role": "system", "content": self._identity_override})
 
             # Safety net: strip orphaned tool results / add stubs for missing
             # results before sending to the API.  Runs unconditionally — not
