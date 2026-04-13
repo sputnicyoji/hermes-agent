@@ -83,30 +83,56 @@ class TestExtractText:
     def test_extracts_dict_text(self):
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = MagicMock()
+        msg.message_type = "text"
         msg.text = {"content": "  hello world  "}
-        msg.rich_text = None
         assert DingTalkAdapter._extract_text(msg) == "hello world"
 
     def test_extracts_string_text(self):
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = MagicMock()
+        msg.message_type = "text"
         msg.text = "plain text"
-        msg.rich_text = None
         assert DingTalkAdapter._extract_text(msg) == "plain text"
-
-    def test_falls_back_to_rich_text(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
-        msg = MagicMock()
-        msg.text = ""
-        msg.rich_text = [{"text": "part1"}, {"text": "part2"}, {"image": "url"}]
-        assert DingTalkAdapter._extract_text(msg) == "part1 part2"
 
     def test_returns_empty_for_no_content(self):
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = MagicMock()
+        msg.message_type = "text"
         msg.text = ""
-        msg.rich_text = None
         assert DingTalkAdapter._extract_text(msg) == ""
+
+    def test_picture_msgtype_returns_placeholder(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        msg = MagicMock()
+        msg.message_type = "picture"
+        assert DingTalkAdapter._extract_text(msg) == "[图片]"
+
+    def test_rich_text_renders_segments_and_at_mentions(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        msg = MagicMock()
+        msg.message_type = "richText"
+        rich = MagicMock()
+        rich.rich_text_list = [
+            {"text": "hi"},
+            {"type": "at", "name": "Yoji"},
+            {"downloadCode": "abc"},
+            {"text": "there"},
+        ]
+        msg.rich_text_content = rich
+        assert DingTalkAdapter._extract_text(msg) == "hi @Yoji [图片] there"
+
+    def test_unsupported_msgtype_returns_labelled_placeholder(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        msg = MagicMock()
+        msg.message_type = "audio"
+        assert DingTalkAdapter._extract_text(msg) == "[未支持的消息类型: audio]"
+
+    def test_explicit_msgtype_arg_wins_over_attribute(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        msg = MagicMock()
+        msg.message_type = "text"
+        msg.text = "ignored"
+        assert DingTalkAdapter._extract_text(msg, msgtype="picture") == "[图片]"
 
 
 # ---------------------------------------------------------------------------

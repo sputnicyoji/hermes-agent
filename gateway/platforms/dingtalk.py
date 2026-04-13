@@ -57,6 +57,14 @@ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 _SESSION_WEBHOOKS_MAX = 500
 _DINGTALK_WEBHOOK_RE = re.compile(r'^https://api\.dingtalk\.com/')
 
+# DingTalk Stream only delivers these three msgtypes to chatbot callbacks.
+# The SDK exposes them as raw string literals, so we pin our own constants
+# to keep dispatch sites from growing divergent typos.
+_MSGTYPE_TEXT = "text"
+_MSGTYPE_PICTURE = "picture"
+_MSGTYPE_RICH_TEXT = "richText"
+_PICTURE_PLACEHOLDER = "[图片]"
+
 
 def check_dingtalk_requirements() -> bool:
     """Check if DingTalk dependencies are available and configured."""
@@ -181,10 +189,19 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.debug("[%s] Duplicate message %s, skipping", self.name, msg_id)
             return
 
-        text = self._extract_text(message)
+        msgtype = getattr(message, "message_type", None) or ""
+        text = self._extract_text(message, msgtype)
+
+        # Empty plain-text is usually a stripped at-mention or keep-alive — drop it.
+        # Every other msgtype still dispatches with a placeholder so the agent
+        # knows something non-text arrived.
         if not text:
-            logger.debug("[%s] Empty message, skipping", self.name)
-            return
+            if msgtype in ("", _MSGTYPE_TEXT):
+                logger.debug("[%s] Empty text message, skipping", self.name)
+                return
+            text = f"[未能解析的 {msgtype} 类型消息]"
+
+        event_type = MessageType.PHOTO if msgtype == _MSGTYPE_PICTURE else MessageType.TEXT
 
         # Chat context
         conversation_id = getattr(message, "conversation_id", "") or ""
@@ -226,7 +243,7 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         event = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=event_type,
             source=source,
             message_id=msg_id,
             raw_message=message,
@@ -238,22 +255,61 @@ class DingTalkAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     @staticmethod
-    def _extract_text(message: "ChatbotMessage") -> str:
-        """Extract plain text from a DingTalk chatbot message."""
-        text = getattr(message, "text", None) or ""
-        if isinstance(text, dict):
-            content = text.get("content", "").strip()
-        else:
-            content = str(text).strip()
+    def _extract_text(message: "ChatbotMessage", msgtype: Optional[str] = None) -> str:
+        """Render a DingTalk chatbot message as human-readable text.
 
-        # Fall back to rich text if present
-        if not content:
-            rich_text = getattr(message, "rich_text", None)
-            if rich_text and isinstance(rich_text, list):
-                parts = [item["text"] for item in rich_text
-                         if isinstance(item, dict) and item.get("text")]
-                content = " ".join(parts).strip()
-        return content
+        Picture downloads would require the ``robot/messageFiles/download``
+        OpenAPI scope which this adapter deliberately does not call —
+        picture segments are replaced with a ``[图片]`` placeholder so the
+        agent at least sees that something visual arrived.
+        """
+        if msgtype is None:
+            msgtype = getattr(message, "message_type", None) or ""
+
+        if msgtype == _MSGTYPE_TEXT:
+            return DingTalkAdapter._read_plain_text(message)
+        if msgtype == _MSGTYPE_RICH_TEXT:
+            return DingTalkAdapter._render_rich_text(message)
+        if msgtype == _MSGTYPE_PICTURE:
+            return _PICTURE_PLACEHOLDER
+        if msgtype:
+            return f"[未支持的消息类型: {msgtype}]"
+        return DingTalkAdapter._read_plain_text(message)
+
+    @staticmethod
+    def _read_plain_text(message: "ChatbotMessage") -> str:
+        text_attr = getattr(message, "text", None)
+        if text_attr is None:
+            return ""
+        if hasattr(text_attr, "content"):
+            return (text_attr.content or "").strip()
+        if isinstance(text_attr, dict):
+            return (text_attr.get("content") or "").strip()
+        return str(text_attr).strip()
+
+    @staticmethod
+    def _render_rich_text(message: "ChatbotMessage") -> str:
+        rich = getattr(message, "rich_text_content", None)
+        items = getattr(rich, "rich_text_list", None) if rich is not None else None
+        if not isinstance(items, list):
+            return ""
+
+        out = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            text_val = item.get("text")
+            if text_val:
+                out.append(str(text_val))
+                continue
+            if item.get("downloadCode") or item.get("type") == "picture":
+                out.append(_PICTURE_PLACEHOLDER)
+                continue
+            if item.get("type") == "at":
+                who = item.get("name") or item.get("userId")
+                if who:
+                    out.append(f"@{who}")
+        return " ".join(out).strip()
 
     # -- Outbound messaging -------------------------------------------------
 
