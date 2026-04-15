@@ -24,7 +24,9 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 try:
     import dingtalk_stream
@@ -44,10 +46,12 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
+    SUPPORTED_DOCUMENT_TYPES,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
     SendResult,
+    cache_document_from_bytes,
     cache_image_from_url,
 )
 
@@ -58,13 +62,20 @@ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 _SESSION_WEBHOOKS_MAX = 500
 _DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:o?api)\.dingtalk\.com/')
 
-# DingTalk Stream only delivers these three msgtypes to chatbot callbacks.
+# DingTalk Stream only delivers a handful of msgtypes to chatbot callbacks.
 # The SDK exposes them as raw string literals, so we pin our own constants
 # to keep dispatch sites from growing divergent typos.
 _MSGTYPE_TEXT = "text"
 _MSGTYPE_PICTURE = "picture"
 _MSGTYPE_RICH_TEXT = "richText"
+_MSGTYPE_FILE = "file"
 _PICTURE_PLACEHOLDER = "[图片]"
+_FILE_PLACEHOLDER = "[文件]"
+_DEFAULT_FILE_MIME = "application/octet-stream"
+# Hard ceiling per inbound file — avoids caching a whole 200 MB archive
+# just because someone drops it in a group. 32 MB covers realistic docs
+# (PDFs, slide decks, small datasets) without blocking obvious abuse.
+_MAX_FILE_BYTES = 32 * 1024 * 1024
 
 
 def check_dingtalk_requirements() -> bool:
@@ -215,7 +226,12 @@ class DingTalkAdapter(BasePlatformAdapter):
                 return
             text = f"[未能解析的 {msgtype} 类型消息]"
 
-        event_type = MessageType.PHOTO if msgtype == _MSGTYPE_PICTURE else MessageType.TEXT
+        if msgtype == _MSGTYPE_PICTURE:
+            event_type = MessageType.PHOTO
+        elif msgtype == _MSGTYPE_FILE:
+            event_type = MessageType.DOCUMENT
+        else:
+            event_type = MessageType.TEXT
 
         # Chat context
         conversation_id = getattr(message, "conversation_id", "") or ""
@@ -257,9 +273,10 @@ class DingTalkAdapter(BasePlatformAdapter):
         except (ValueError, OSError, TypeError):
             timestamp = datetime.now(tz=timezone.utc)
 
-        # Download picture attachments so the vision model sees real bytes
-        # instead of the [图片] placeholder. Applies to both `picture` and
-        # `richText` msgtypes (richText can carry inline images).
+        # Download attachments so the agent sees real bytes instead of a
+        # bare ``[图片]`` / ``[文件]`` placeholder. Pictures flow through
+        # both ``picture`` and ``richText`` msgtypes (richText can carry
+        # inline images); files are their own top-level msgtype.
         media_urls: List[str] = []
         media_types: List[str] = []
         if msgtype in (_MSGTYPE_PICTURE, _MSGTYPE_RICH_TEXT):
@@ -268,6 +285,14 @@ class DingTalkAdapter(BasePlatformAdapter):
                 # Swap the bare placeholder for a short caption so the agent
                 # knows to look at the attachment list.
                 text = f"[图片 × {len(media_urls)}]"
+        elif msgtype == _MSGTYPE_FILE:
+            file_path, file_mime, file_name = await self._fetch_file_attachment(message)
+            if file_path:
+                media_urls = [file_path]
+                media_types = [file_mime]
+                # Surface the original filename so the agent knows what it
+                # got without having to peek inside media_urls.
+                text = f"[文件: {file_name}]" if file_name else _FILE_PLACEHOLDER
 
         event = MessageEvent(
             text=text,
@@ -335,14 +360,121 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.warning("[%s] Picture cache failed: %s", self.name, e)
             return None
 
+    async def _fetch_file_attachment(
+        self, message: "ChatbotMessage"
+    ) -> Tuple[Optional[str], str, Optional[str]]:
+        """Download a ``msgtype=file`` attachment to the document cache.
+
+        The SDK's ``from_dict`` does not parse the ``file`` msgtype, so
+        the payload (``downloadCode`` + ``fileName``) lands in
+        ``message.extensions['content']`` verbatim. The download itself
+        reuses ``get_image_download_url`` — despite the name, that SDK
+        method hits ``/v1.0/robot/messageFiles/download`` which handles
+        files and pictures uniformly.
+
+        Returns ``(local_path, mime_type, file_name)``. Any failure yields
+        ``(None, _DEFAULT_FILE_MIME, file_name_if_known)`` so the caller
+        can still surface the filename in the text placeholder.
+        """
+        content = message.extensions.get("content")
+        if not isinstance(content, dict):
+            return None, _DEFAULT_FILE_MIME, None
+
+        download_code = content.get("downloadCode")
+        file_name = content.get("fileName") or None
+        if not download_code or self._handler is None or self._http_client is None:
+            return None, _DEFAULT_FILE_MIME, file_name
+
+        try:
+            download_url = await asyncio.to_thread(
+                self._handler.get_image_download_url, download_code
+            )
+        except Exception:
+            logger.exception("[%s] get_image_download_url(file) failed", self.name)
+            return None, _DEFAULT_FILE_MIME, file_name
+        if not download_url:
+            logger.warning(
+                "[%s] No downloadUrl for file code %s…",
+                self.name, str(download_code)[:16],
+            )
+            return None, _DEFAULT_FILE_MIME, file_name
+
+        # Single-user agent, URL is signed by DingTalk's authenticated API:
+        # no pre-flight URL validation needed. httpx rejects non-http(s)
+        # schemes itself, and CN accelerators rewriting aliyuncs.com to
+        # 198.18.0.0/15 virtual IPs would trip any SSRF/scheme guard.
+
+        try:
+            # HEAD is not reliable on DingTalk CDN; use a streaming GET
+            # so we can reject oversized bodies via Content-Length before
+            # buffering the whole thing into memory.
+            async with self._http_client.stream("GET", download_url, timeout=60.0) as resp:
+                resp.raise_for_status()
+                declared = resp.headers.get("content-length")
+                if declared and declared.isdigit() and int(declared) > _MAX_FILE_BYTES:
+                    logger.warning(
+                        "[%s] File %s declared %s bytes > %d cap, skipping",
+                        self.name, file_name or "?", declared, _MAX_FILE_BYTES,
+                    )
+                    return None, _DEFAULT_FILE_MIME, file_name
+                chunks: List[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > _MAX_FILE_BYTES:
+                        logger.warning(
+                            "[%s] File %s exceeded %d bytes mid-stream, aborting",
+                            self.name, file_name or "?", _MAX_FILE_BYTES,
+                        )
+                        return None, _DEFAULT_FILE_MIME, file_name
+                    chunks.append(chunk)
+                content_type = resp.headers.get("content-type", "")
+        except httpx.HTTPError as e:
+            host = urlparse(download_url).hostname or "?"
+            logger.warning(
+                "[%s] File download failed (host=%s): %s",
+                self.name, host, e,
+            )
+            return None, _DEFAULT_FILE_MIME, file_name
+
+        data = b"".join(chunks)
+        if not data:
+            logger.warning("[%s] File download returned empty body", self.name)
+            return None, _DEFAULT_FILE_MIME, file_name
+
+        # Extension table first (vetted whitelist), CDN content-type next
+        # (often lies as octet-stream for unknown ext), octet-stream last.
+        safe_name = file_name or "attachment.bin"
+        ext = Path(safe_name).suffix.lower()
+        mime = (
+            SUPPORTED_DOCUMENT_TYPES.get(ext)
+            or content_type.split(";")[0].strip()
+            or _DEFAULT_FILE_MIME
+        )
+
+        try:
+            # POSIX-form path: the agent's shell is usually bash (WSL on
+            # Windows), which chokes on backslashes. Forward-slash form
+            # is accepted by Python, WSL, and native Windows tools alike.
+            local_path = Path(cache_document_from_bytes(data, safe_name)).as_posix()
+        except (OSError, ValueError) as e:
+            logger.warning("[%s] File cache failed: %s", self.name, e)
+            return None, _DEFAULT_FILE_MIME, file_name
+
+        logger.info(
+            "[%s] Cached inbound file %s (%d bytes) -> %s",
+            self.name, safe_name, len(data), local_path,
+        )
+        return local_path, mime, file_name
+
     @staticmethod
     def _extract_text(message: "ChatbotMessage", msgtype: Optional[str] = None) -> str:
         """Render a DingTalk chatbot message as human-readable text.
 
-        Pictures download require the ``robot/messageFiles/download`` OpenAPI
-        scope which this adapter deliberately does not call — picture
-        segments are replaced with a ``[图片]`` placeholder so the agent at
-        least sees that something visual arrived.
+        Binary payloads (pictures, files) resolve to a placeholder here;
+        the caller in :meth:`_on_message` downloads the bytes via the
+        ``robot/messageFiles/download`` OpenAPI and replaces this text
+        with a richer caption once media_urls are attached.
         """
         if msgtype is None:
             msgtype = getattr(message, "message_type", None) or ""
@@ -353,6 +485,10 @@ class DingTalkAdapter(BasePlatformAdapter):
             return DingTalkAdapter._render_rich_text(message)
         if msgtype == _MSGTYPE_PICTURE:
             return _PICTURE_PLACEHOLDER
+        if msgtype == _MSGTYPE_FILE:
+            content = message.extensions.get("content")
+            name = content.get("fileName") if isinstance(content, dict) else None
+            return f"[文件: {name}]" if name else _FILE_PLACEHOLDER
         if msgtype:
             return f"[未支持的消息类型: {msgtype}]"
         return DingTalkAdapter._read_plain_text(message)
