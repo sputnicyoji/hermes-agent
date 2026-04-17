@@ -1,0 +1,10 @@
+approvals:
+  timeout_hours: 4
+  roles_high_priority: ["上级", "客户"]
+  initiated_process_codes: []
+reports:
+  include_senders: []
+  exclude_templates: []
+todos:
+  stale_days: 7
+  reminder_interval_days: 3
