@@ -3830,8 +3830,8 @@ class GatewayRunner:
                 if mtype.startswith("text/"):
                     context_note = (
                         f"[The user sent a text document: '{display_name}'. "
-                        f"Its content has been included below. "
-                        f"The file is also saved at: {path}]"
+                        f"The file is saved at: {path}. "
+                        f"Use the read_file tool to read its content.]"
                     )
                 else:
                     context_note = (
