@@ -799,31 +799,30 @@ class TestEdgeCases:
         assert default.skill_count == 0
 
     def test_gateway_running_check_with_pid_file(self, profile_env):
+        """Verify _check_gateway_running uses the shared gateway PID validator."""
         from hermes_cli.profiles import _check_gateway_running
         tmp_path = profile_env
         default_home = tmp_path / ".hermes"
 
-        assert _check_gateway_running(default_home) is False
-
-        pid_file = default_home / "gateway.pid"
-        pid_file.write_text(json.dumps({"pid": 99999}))
-        assert _check_gateway_running(default_home) is False
-
-        # Use the test's own PID as a guaranteed-live target; this exercises
-        # the cross-platform is_process_alive path without patching os.kill
-        # (which wouldn't intercept the Windows ctypes OpenProcess branch).
-        pid_file.write_text(json.dumps({"pid": os.getpid()}))
-        assert _check_gateway_running(default_home) is True
+        with patch("gateway.status.get_running_pid", return_value=99999) as mock_get_running_pid:
+            assert _check_gateway_running(default_home) is True
+        mock_get_running_pid.assert_called_once_with(
+            default_home / "gateway.pid",
+            cleanup_stale=False,
+        )
 
     def test_gateway_running_check_plain_pid(self, profile_env):
-        """Pid file containing just a number (legacy format)."""
+        """Shared PID validator returning None means the profile is not running."""
         from hermes_cli.profiles import _check_gateway_running
         tmp_path = profile_env
         default_home = tmp_path / ".hermes"
-        pid_file = default_home / "gateway.pid"
-        pid_file.write_text(str(os.getpid()))
 
-        assert _check_gateway_running(default_home) is True
+        with patch("gateway.status.get_running_pid", return_value=None) as mock_get_running_pid:
+            assert _check_gateway_running(default_home) is False
+        mock_get_running_pid.assert_called_once_with(
+            default_home / "gateway.pid",
+            cleanup_stale=False,
+        )
 
     def test_profile_name_boundary_single_char(self):
         """Single alphanumeric character is valid."""
