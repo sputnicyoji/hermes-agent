@@ -146,3 +146,51 @@ class TestCheckLintBracePaths:
 
         assert result.success is False
         assert "SyntaxError" in result.output
+
+
+class TestWindowsPathNormalization:
+    """Verify Windows absolute paths are mapped for POSIX shells."""
+
+    @pytest.fixture()
+    def ops(self):
+        obj = ShellFileOperations.__new__(ShellFileOperations)
+        obj.env = MagicMock()
+        obj.cwd = "/"
+        return obj
+
+    def test_wsl_style_cwd_maps_to_mnt(self, ops):
+        """WSL bash (``/mnt/<drive>/...`` cwd) should rewrite C:/ → /mnt/c/."""
+        ops.env.cwd = "/mnt/d/Hermes_Agent"
+        p = "C:/Users/alice/.hermes/cache/documents/a(1).md"
+        assert (
+            ops._normalize_windows_abs_path_for_posix_shell(p)
+            == "/mnt/c/Users/alice/.hermes/cache/documents/a(1).md"
+        )
+
+    def test_git_bash_style_cwd_maps_to_drive_root(self, ops):
+        r"""Git Bash / MSYS2 (``/<drive>/...`` cwd) should rewrite C:\ → /c/."""
+        ops.env.cwd = "/d/Hermes_Agent"
+        p = r"C:\Users\alice\.hermes\cache\documents\a(1).md"
+        assert (
+            ops._normalize_windows_abs_path_for_posix_shell(p)
+            == "/c/Users/alice/.hermes/cache/documents/a(1).md"
+        )
+
+    def test_non_posix_cwd_keeps_windows_path(self, ops):
+        """Native Windows cwd means the consumer is not bash — leave as-is."""
+        ops.env.cwd = r"D:\Hermes_Agent"
+        p = "C:/Users/alice/.hermes/cache/documents/a.md"
+        assert ops._normalize_windows_abs_path_for_posix_shell(p) == p
+
+    def test_posix_path_passes_through(self, ops):
+        """Already-POSIX paths should not be rewritten even under WSL cwd."""
+        ops.env.cwd = "/mnt/d/repo"
+        p = "/mnt/c/Users/alice/file.md"
+        assert ops._normalize_windows_abs_path_for_posix_shell(p) == p
+
+    def test_drive_letter_only(self, ops):
+        """Drive root without trailing path still maps cleanly."""
+        ops.env.cwd = "/mnt/d/repo"
+        assert ops._normalize_windows_abs_path_for_posix_shell("C:/") == "/mnt/c"
+        ops.env.cwd = "/d/repo"
+        assert ops._normalize_windows_abs_path_for_posix_shell("C:\\") == "/c"

@@ -469,9 +469,46 @@ class ShellFileOperations(FileOperations):
                         user_home = expand_result.stdout.strip()
                         suffix = path[1 + len(username):]  # e.g. "/rest/of/path"
                         return user_home + suffix
-        
+
+        return self._normalize_windows_abs_path_for_posix_shell(path)
+
+    def _normalize_windows_abs_path_for_posix_shell(self, path: str) -> str:
+        """Map a Windows absolute path to the form the active POSIX shell accepts.
+
+        Hermes runs every shell command through ``bash -c``. On Windows,
+        ``bash`` can resolve to WSL bash (``/mnt/<drive>/...`` roots) or
+        Git Bash / MSYS2 (``/<drive>/...`` roots). Neither can open a bare
+        ``C:/...`` path — they report "No such file or directory" even
+        though the file exists on the host filesystem.
+
+        Detect which shell is active by inspecting the live terminal cwd:
+
+          * ``/mnt/...`` prefix → WSL bash. Map ``C:/foo`` → ``/mnt/c/foo``.
+          * any other POSIX absolute cwd → Git Bash / MSYS2. Map
+            ``C:\\foo`` → ``/c/foo``.
+          * anything else (native Windows cwd, or no cwd info) → pass
+            through unchanged.
+
+        Both backslash and forward-slash drive-letter forms are accepted.
+        """
+        if not path:
+            return path
+
+        match = re.match(r"^([A-Za-z]):[\\/](.*)$", path)
+        if not match:
+            return path
+
+        shell_cwd = str(getattr(self.env, "cwd", None) or self.cwd or "")
+        drive = match.group(1).lower()
+        rest = match.group(2).replace("\\", "/").lstrip("/")
+
+        if shell_cwd.startswith("/mnt/"):
+            return f"/mnt/{drive}/{rest}" if rest else f"/mnt/{drive}"
+        if shell_cwd.startswith("/"):
+            return f"/{drive}/{rest}" if rest else f"/{drive}"
+
         return path
-    
+
     def _escape_shell_arg(self, arg: str) -> str:
         """Escape a string for safe use in shell commands."""
         # Use single quotes and escape any single quotes in the string
