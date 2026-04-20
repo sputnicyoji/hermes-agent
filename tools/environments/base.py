@@ -13,6 +13,7 @@ import os
 import select
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -24,6 +25,13 @@ from hermes_constants import get_hermes_home
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
+
+# Windows: ``select.select()`` only works on sockets, not pipe FDs. Calling
+# it on a subprocess stdout pipe raises ``OSError (WinError 10093)``
+# immediately, which the drain loop silently swallows — resulting in every
+# shell command returning rc=0 with empty stdout. ``_drain_windows`` below
+# uses blocking reads instead.
+_IS_WINDOWS = sys.platform == "win32"
 
 # Opt-in debug tracing for the interrupt/activity/poll machinery.  Set
 # HERMES_DEBUG_INTERRUPT=1 to log loop entry/exit, periodic heartbeats, and
@@ -464,7 +472,7 @@ class BaseEnvironment(ABC):
         # U+FFFD substitution rather than clobbering the whole buffer.
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
-        def _drain():
+        def _drain_posix():
             fd = proc.stdout.fileno()
             idle_after_exit = 0
             try:
@@ -499,6 +507,34 @@ class BaseEnvironment(ABC):
                         output_chunks.append(tail)
                 except Exception:
                     pass
+
+        def _drain_windows():
+            # Windows has no selectable pipes (``select.select`` is
+            # Winsock-only). Block on ``os.read`` until EOF. The
+            # orphan-pipe hang that motivates the POSIX select()
+            # approach is less of a concern here: Git Bash / MSYS2 on
+            # Windows typically does not fork & disown long-lived
+            # grandchildren the same way, and if one does, the outer
+            # ``proc.poll()``/timeout loop in ``_wait_for_process``
+            # still terminates the wait and kills the process group.
+            try:
+                while True:
+                    try:
+                        chunk = os.read(proc.stdout.fileno(), 4096)
+                    except (ValueError, OSError):
+                        break
+                    if not chunk:
+                        break  # EOF
+                    output_chunks.append(decoder.decode(chunk))
+            finally:
+                try:
+                    tail = decoder.decode(b"", final=True)
+                    if tail:
+                        output_chunks.append(tail)
+                except Exception:
+                    pass
+
+        _drain = _drain_windows if _IS_WINDOWS else _drain_posix
 
         drain_thread = threading.Thread(target=_drain, daemon=True)
         drain_thread.start()
