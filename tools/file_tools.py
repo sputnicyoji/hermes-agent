@@ -20,6 +20,7 @@ from tools import file_state
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+_DEBUG_FILE_IO = str(os.getenv("HERMES_DEBUG_FILE_IO", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
@@ -354,6 +355,11 @@ def clear_file_ops_cache(task_id: str = None):
 
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
+    if _DEBUG_FILE_IO:
+        logger.debug(
+            "[diag-tool] read_file_tool called: path=%r offset=%d limit=%d task_id=%r",
+            path, offset, limit, task_id,
+        )
     try:
         offset, limit = normalize_read_pagination(offset, limit)
 

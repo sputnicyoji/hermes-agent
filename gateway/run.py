@@ -32,6 +32,11 @@ from typing import Dict, Optional, Any, List
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 
+
+def _quote_for_system_note(value: Any) -> str:
+    """Return an escaped single-line literal for bracketed system notes."""
+    return json.dumps(str(value), ensure_ascii=True)
+
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
 # long-lived gateways (each AIAgent holds LLM clients, tool schemas,
@@ -3941,17 +3946,19 @@ class GatewayRunner:
                 parts = basename.split("_", 2)
                 display_name = parts[2] if len(parts) >= 3 else basename
                 display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                safe_display_name = _quote_for_system_note(display_name)
+                safe_path = _quote_for_system_note(path)
 
                 if mtype.startswith("text/"):
                     context_note = (
-                        f"[The user sent a text document: '{display_name}'. "
-                        f"Its content has been included below. "
-                        f"The file is also saved at: {path}]"
+                        f"[The user sent a text document: {safe_display_name}. "
+                        f"The file is saved at: {safe_path}. "
+                        f"Use the read_file tool to read its content.]"
                     )
                 else:
                     context_note = (
-                        f"[The user sent a document: '{display_name}'. "
-                        f"The file is saved at: {path}. "
+                        f"[The user sent a document: {safe_display_name}. "
+                        f"The file is saved at: {safe_path}. "
                         f"Ask the user what they'd like you to do with it.]"
                     )
                 message_text = f"{context_note}\n\n{message_text}"

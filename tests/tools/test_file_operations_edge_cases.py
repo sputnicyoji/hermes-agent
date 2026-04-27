@@ -204,3 +204,35 @@ class TestPaginationBounds:
         rg_commands = [cmd for cmd in commands if cmd.startswith("rg --files")]
         assert rg_commands
         assert "| head -n 1" in rg_commands[0]
+
+
+class TestWindowsPathNormalization:
+    """Verify Windows absolute paths are mapped for POSIX shells."""
+
+    @pytest.fixture()
+    def ops(self):
+        obj = ShellFileOperations.__new__(ShellFileOperations)
+        obj.env = MagicMock()
+        obj.cwd = "/"
+        return obj
+
+    def test_wsl_style_cwd_maps_to_mnt(self, ops):
+        ops.env.cwd = "/mnt/d/Hermes_Agent"
+        p = "C:/Users/zhangxuechen/.hermes/cache/documents/a(1).md"
+        assert (
+            ops._normalize_windows_abs_path_for_posix_shell(p)
+            == "/mnt/c/Users/zhangxuechen/.hermes/cache/documents/a(1).md"
+        )
+
+    def test_git_bash_style_cwd_maps_to_drive_root(self, ops):
+        ops.env.cwd = "/d/Hermes_Agent"
+        p = r"C:\Users\zhangxuechen\.hermes\cache\documents\a(1).md"
+        assert (
+            ops._normalize_windows_abs_path_for_posix_shell(p)
+            == "/c/Users/zhangxuechen/.hermes/cache/documents/a(1).md"
+        )
+
+    def test_non_posix_cwd_keeps_windows_path(self, ops):
+        ops.env.cwd = r"D:\Hermes_Agent"
+        p = "C:/Users/zhangxuechen/.hermes/cache/documents/a.md"
+        assert ops._normalize_windows_abs_path_for_posix_shell(p) == p

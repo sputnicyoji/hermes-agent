@@ -98,6 +98,19 @@ class TestCacheDocumentFromBytes:
         path = cache_document_from_bytes(b"data", None)
         assert "document" in os.path.basename(path)
 
+    def test_control_chars_stripped_from_filename(self):
+        path = cache_document_from_bytes(b"data", "evil\nname\r\t\x1f\x7f].md")
+        basename = os.path.basename(path)
+        assert "\n" not in basename
+        assert "\r" not in basename
+        assert "\t" not in basename
+        assert "\x1f" not in basename
+        assert "\x7f" not in basename
+
+    def test_all_control_chars_filename_falls_back(self):
+        path = cache_document_from_bytes(b"data", "\n\r\t\x1f\x7f")
+        assert "document" in os.path.basename(path)
+
 
 # ---------------------------------------------------------------------------
 # TestCleanupDocumentCache

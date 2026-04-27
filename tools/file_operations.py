@@ -27,6 +27,7 @@ Usage:
 
 import os
 import re
+import logging
 import difflib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -41,6 +42,9 @@ from agent.file_safety import (
     get_safe_write_root as _shared_get_safe_write_root,
     is_write_denied as _shared_is_write_denied,
 )
+
+logger = logging.getLogger(__name__)
+_DEBUG_FILE_IO = str(os.getenv("HERMES_DEBUG_FILE_IO", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -457,7 +461,33 @@ class ShellFileOperations(FileOperations):
                         user_home = expand_result.stdout.strip()
                         suffix = path[1 + len(username):]  # e.g. "/rest/of/path"
                         return user_home + suffix
-        
+
+        return self._normalize_windows_abs_path_for_posix_shell(path)
+
+    def _normalize_windows_abs_path_for_posix_shell(self, path: str) -> str:
+        """
+        Convert Windows absolute paths for POSIX shells when needed.
+
+        Example:
+            C:/Users/Alice/file.txt -> /mnt/c/Users/Alice/file.txt   (WSL bash)
+            C:\\Users\\Alice\\file.txt -> /c/Users/Alice/file.txt     (Git Bash)
+        """
+        if not path:
+            return path
+
+        match = re.match(r"^([A-Za-z]):[\\\\/](.*)$", path)
+        if not match:
+            return path
+
+        shell_cwd = str(getattr(self.env, "cwd", None) or self.cwd or "")
+        drive = match.group(1).lower()
+        rest = match.group(2).replace("\\", "/").lstrip("/")
+
+        if shell_cwd.startswith("/mnt/"):
+            return f"/mnt/{drive}/{rest}" if rest else f"/mnt/{drive}"
+        if shell_cwd.startswith("/"):
+            return f"/{drive}/{rest}" if rest else f"/{drive}"
+
         return path
     
     def _escape_shell_arg(self, arg: str) -> str:
@@ -493,16 +523,30 @@ class ShellFileOperations(FileOperations):
             ReadResult with content, metadata, or error info
         """
         # Expand ~ and other shell paths
+        orig_path = path
         path = self._expand_path(path)
-        
+
         offset, limit = normalize_read_pagination(offset, limit)
-        
+
+
         # Check if file exists and get size (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
+        if _DEBUG_FILE_IO:
+            logger.debug(
+                "[diag-read] orig=%r expanded=%r escaped=%r stat_cmd=%r",
+                orig_path, path, self._escape_shell_arg(path), stat_cmd,
+            )
         stat_result = self._exec(stat_cmd)
-        
+        if _DEBUG_FILE_IO:
+            logger.debug(
+                "[diag-read] stat rc=%d stdout=%r",
+                stat_result.exit_code, stat_result.stdout[:200],
+            )
+
         if stat_result.exit_code != 0:
             # File not found - try to suggest similar files
+            if _DEBUG_FILE_IO:
+                logger.debug("[diag-read] stat failed, falling back to _suggest_similar_files")
             return self._suggest_similar_files(path)
         
         try:

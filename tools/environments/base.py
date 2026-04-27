@@ -13,6 +13,7 @@ import os
 import select
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -21,6 +22,13 @@ from pathlib import Path
 from typing import IO, Callable, Protocol
 
 from hermes_constants import get_hermes_home
+
+# Windows: ``select.select()`` only works on sockets, not pipe FDs. Calling
+# it on a subprocess stdout pipe raises ``OSError (WinError 10093)``
+# immediately, which the drain loop silently swallows — resulting in every
+# shell command returning rc=0 with empty stdout. ``_drain_windows`` below
+# uses blocking reads instead.
+_IS_WINDOWS = sys.platform == "win32"
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
@@ -30,6 +38,7 @@ logger = logging.getLogger(__name__)
 # every is_interrupted() state change from _wait_for_process.  Off by default
 # to avoid flooding production gateway logs.
 _DEBUG_INTERRUPT = bool(os.getenv("HERMES_DEBUG_INTERRUPT"))
+_DEBUG_EXEC = str(os.getenv("HERMES_DEBUG_EXEC", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 if _DEBUG_INTERRUPT:
     # AIAgent's quiet_mode path (run_agent.py) forces the `tools` logger to
@@ -464,7 +473,7 @@ class BaseEnvironment(ABC):
         # U+FFFD substitution rather than clobbering the whole buffer.
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
-        def _drain():
+        def _drain_posix():
             fd = proc.stdout.fileno()
             idle_after_exit = 0
             try:
@@ -490,15 +499,38 @@ class BaseEnvironment(ABC):
                         if idle_after_exit >= 3:
                             break
             finally:
-                # Flush any bytes buffered mid-sequence.  With ``errors="replace"``
-                # this emits U+FFFD for any final incomplete sequence rather than
-                # raising.
                 try:
                     tail = decoder.decode(b"", final=True)
                     if tail:
                         output_chunks.append(tail)
                 except Exception:
                     pass
+
+        def _drain_windows():
+            # Windows has no selectable pipes. Do blocking reads until EOF.
+            # The orphan-pipe hang (backgrounded grandchild keeps the write
+            # end open) is less of a concern here because on Windows bash
+            # typically doesn't fork & disown in the same way. If it does,
+            # the outer proc.poll() + timeout loop still terminates the
+            # wait and kills the process group.
+            try:
+                while True:
+                    try:
+                        chunk = os.read(proc.stdout.fileno(), 4096)
+                    except (ValueError, OSError):
+                        break
+                    if not chunk:
+                        break  # EOF
+                    output_chunks.append(decoder.decode(chunk))
+            finally:
+                try:
+                    tail = decoder.decode(b"", final=True)
+                    if tail:
+                        output_chunks.append(tail)
+                except Exception:
+                    pass
+
+        _drain = _drain_windows if _IS_WINDOWS else _drain_posix
 
         drain_thread = threading.Thread(target=_drain, daemon=True)
         drain_thread.start()
@@ -703,6 +735,10 @@ class BaseEnvironment(ABC):
     ) -> dict:
         """Execute a command, return {"output": str, "returncode": int}."""
         self._before_execute()
+
+        if _DEBUG_EXEC:
+            _cmd_preview = command[:300].replace("\r", "\\r").replace("\n", "\\n")
+            logger.debug("[diag-exec] cmd=%r cwd=%r", _cmd_preview, cwd)
 
         exec_command, sudo_stdin = self._prepare_command(command)
         # Guard against the `A && B &` subshell-wait trap: bash forks a

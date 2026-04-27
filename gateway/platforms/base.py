@@ -585,6 +585,7 @@ def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
 # ---------------------------------------------------------------------------
 
 DOCUMENT_CACHE_DIR = get_hermes_dir("cache/documents", "document_cache")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 SUPPORTED_DOCUMENT_TYPES = {
     ".pdf": "application/pdf",
@@ -624,7 +625,11 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
     cache_dir = get_document_cache_dir()
     # Sanitize: strip directory components, null bytes, and control characters
     safe_name = Path(filename).name if filename else "document"
-    safe_name = safe_name.replace("\x00", "").strip()
+    # Strip ASCII control chars to prevent newline/control-sequence injection
+    # in downstream prompt/system-note rendering that references cached paths.
+    safe_name = _CONTROL_CHARS_RE.sub("", safe_name).strip()
+    if len(safe_name) > 180:
+        safe_name = safe_name[:180]
     if not safe_name or safe_name in (".", ".."):
         safe_name = "document"
     cached_name = f"doc_{uuid.uuid4().hex[:12]}_{safe_name}"

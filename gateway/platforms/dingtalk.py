@@ -34,7 +34,9 @@ import re
 import traceback
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 try:
     import dingtalk_stream
@@ -94,6 +96,8 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    SUPPORTED_DOCUMENT_TYPES,
+    cache_document_from_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,6 +112,15 @@ DINGTALK_TYPE_MAPPING = {
     "picture": "image",
     "voice": "audio",
 }
+
+# msgtype string constants (the SDK exposes these as raw literals)
+_MSGTYPE_FILE = "file"
+_MSGTYPE_PICTURE = "picture"
+_MSGTYPE_RICH_TEXT = "richText"
+_FILE_PLACEHOLDER = "[文件]"
+_DEFAULT_FILE_MIME = "application/octet-stream"
+# Hard ceiling per inbound file — avoids caching a whole 200 MB archive
+_MAX_FILE_BYTES = 32 * 1024 * 1024
 
 
 def check_dingtalk_requirements() -> bool:
@@ -177,6 +190,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._http_client: Optional["httpx.AsyncClient"] = None
         self._card_sdk: Optional[Any] = None
         self._robot_sdk: Optional[Any] = None
+        self._handler: Optional[Any] = None
         self._robot_code: str = extra.get("robot_code") or self._client_id
 
         # Message deduplication
@@ -261,6 +275,13 @@ class DingTalkAdapter(BasePlatformAdapter):
             self._stream_client.register_callback_handler(
                 dingtalk_stream.ChatbotMessage.TOPIC, handler
             )
+            # Keep the handler reachable so we can use its SDK-native helpers
+            # (e.g. get_image_download_url) to resolve media download codes.
+            # The alibabacloud Robot SDK path returns HTTP 500 "unknownError"
+            # because its sdk_config has no AK/SK; the Stream SDK helper uses
+            # the already-cached access token and is the officially documented
+            # flow for this endpoint.
+            self._handler = handler
 
             self._stream_task = asyncio.create_task(self._run_stream())
             self._mark_connected()
@@ -595,6 +616,21 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Determine message type and build media list
         msg_type, media_urls, media_types = self._extract_media(message)
 
+        # Top-level msgtype=file is not parsed by ChatbotMessage.from_dict —
+        # downloadCode and fileName live in message.extensions['content'].
+        # Download the bytes to the local document cache so the agent can
+        # actually read the file contents (e.g. markdown).
+        msgtype_str = getattr(message, "message_type", "") or ""
+        if msgtype_str == _MSGTYPE_FILE:
+            file_path, file_mime, file_name = await self._fetch_file_attachment(message)
+            if file_path:
+                media_urls = [file_path]
+                media_types = [file_mime]
+                msg_type = MessageType.DOCUMENT
+            # Surface the filename in the text so the agent at least knows
+            # what arrived even when the download fails.
+            text = f"[文件: {file_name}]" if file_name else _FILE_PLACEHOLDER
+
         if not text and not media_urls:
             logger.debug("[%s] Empty message, skipping", self.name)
             return
@@ -692,19 +728,24 @@ class DingTalkAdapter(BasePlatformAdapter):
         media_urls = []
         media_types = []
 
-        # Check for image/picture
-        image_content = getattr(message, "image_content", None)
-        if image_content:
-            download_code = getattr(image_content, "download_code", None)
-            if download_code:
-                media_urls.append(download_code)
-                media_types.append("image")
-                msg_type = MessageType.PHOTO
-
-        # Check for rich text with mixed content
+        # DingTalk delivers pictures twice (see _resolve_media_codes): once as
+        # an opaque image_content.download_code (needs enterprise API access
+        # to resolve) and once inside rich_text_content where the "code" is
+        # already a pre-signed OSS URL. Prefer rich_text when present; fall
+        # back to image_content only when its value has actually been resolved
+        # to an HTTP(S) URL by _resolve_media_codes.
         rich_text = getattr(message, "rich_text_content", None) or getattr(
             message, "rich_text", None
         )
+        has_rich_text = bool(rich_text)
+
+        image_content = getattr(message, "image_content", None)
+        if image_content and not has_rich_text:
+            download_code = getattr(image_content, "download_code", None)
+            if download_code and str(download_code).startswith(("http://", "https://")):
+                media_urls.append(download_code)
+                media_types.append("image")
+                msg_type = MessageType.PHOTO
         if rich_text:
             rich_list = getattr(rich_text, "rich_text_list", None) or rich_text
             if isinstance(rich_list, list):
@@ -714,7 +755,11 @@ class DingTalkAdapter(BasePlatformAdapter):
                             item.get("downloadCode") or item.get("download_code") or ""
                         )
                         item_type = item.get("type", "")
-                        if dl_code:
+                        # Only accept values that are already HTTP(S) URLs.
+                        # Raw download codes cannot be resolved by this bot
+                        # (see _resolve_media_codes) and must not reach
+                        # downstream consumers that expect a URL.
+                        if dl_code and str(dl_code).startswith(("http://", "https://")):
                             mapped = DINGTALK_TYPE_MAPPING.get(item_type, "file")
                             media_urls.append(dl_code)
                             if mapped == "image":
@@ -1161,7 +1206,24 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
 
     async def _resolve_media_codes(self, message: "ChatbotMessage") -> None:
-        """Resolve download codes in message to actual URLs."""
+        """Resolve download codes in message to actual URLs.
+
+        Short-circuited for personal / non-enterprise bots: the DingTalk
+        ``robot/messageFiles/download`` endpoint returns HTTP 500
+        ``unknownError`` for apps without enterprise-scoped permissions, so
+        attempting resolution only produces log noise.
+
+        For those bots, ``_extract_media`` relies on the pre-signed OSS URLs
+        that DingTalk delivers inline via ``rich_text_content``. Opaque
+        ``download_code`` values are simply discarded downstream.
+
+        If a future deployment does have the enterprise permission, set
+        ``DINGTALK_ENABLE_MEDIA_RESOLVE=1`` in the environment to re-enable
+        the original resolve-and-mutate flow.
+        """
+        if os.getenv("DINGTALK_ENABLE_MEDIA_RESOLVE", "").strip() not in ("1", "true", "True"):
+            return
+
         token = await self._get_access_token()
         if not token:
             return
@@ -1169,20 +1231,18 @@ class DingTalkAdapter(BasePlatformAdapter):
         robot_code = getattr(message, "robot_code", None) or self._client_id
         codes_to_resolve = []
 
-        # Collect codes and references to update
-        # 1. Single image content
         img_content = getattr(message, "image_content", None)
         if img_content and getattr(img_content, "download_code", None):
             codes_to_resolve.append((img_content, "download_code"))
 
-        # 2. Rich text list
         rich_text = getattr(message, "rich_text_content", None)
         if rich_text:
             rich_list = getattr(rich_text, "rich_text_list", []) or []
             for item in rich_list:
                 if isinstance(item, dict):
                     for key in ("downloadCode", "pictureDownloadCode", "download_code"):
-                        if item.get(key):
+                        val = item.get(key)
+                        if val and not str(val).startswith(("http://", "https://")):
                             codes_to_resolve.append((item, key))
 
         if not codes_to_resolve:
@@ -1202,41 +1262,140 @@ class DingTalkAdapter(BasePlatformAdapter):
     async def _fetch_download_url(
         self, code: str, robot_code: str, token: str, obj, key: str
     ) -> None:
-        """Fetch download URL for a single code using the robot SDK."""
-        if not self._robot_sdk:
+        """Resolve a single download_code to a CDN URL.
+
+        Uses the dingtalk-stream SDK's ChatbotHandler.get_image_download_url
+        helper, which posts to /v1.0/robot/messageFiles/download with just the
+        cached access token. The alibabacloud Robot SDK path (previously used
+        here) returns HTTP 500 "unknownError" in Stream Mode because its
+        sdk_config has no AK/SK credentials — the DingTalk gateway rejects
+        requests that rely solely on x-acs-dingtalk-access-token when routed
+        through the OpenAPI tea client.
+
+        ``robot_code`` and ``token`` are accepted for signature compatibility;
+        the SDK helper reads them from the registered stream client itself.
+        """
+        if not self._handler:
             logger.warning(
-                "[%s] Robot SDK not initialized, cannot resolve media code",
+                "[%s] Stream handler not initialized, cannot resolve media code",
                 self.name,
             )
             return
         try:
-            request = dingtalk_robot_models.RobotMessageFileDownloadRequest(
-                download_code=code,
-                robot_code=robot_code,
-            )
-            headers = dingtalk_robot_models.RobotMessageFileDownloadHeaders(
-                x_acs_dingtalk_access_token=token,
-            )
-            runtime = tea_util_models.RuntimeOptions()
-            response = await self._robot_sdk.robot_message_file_download_with_options_async(
-                request, headers, runtime
-            )
-            body = response.body if response else None
-            if body:
-                url = getattr(body, "download_url", None)
-                if url:
-                    if hasattr(obj, key):
-                        setattr(obj, key, url)
-                    elif isinstance(obj, dict):
-                        obj[key] = url
+            url = await asyncio.to_thread(self._handler.get_image_download_url, code)
+            if url:
+                if hasattr(obj, key):
+                    setattr(obj, key, url)
+                elif isinstance(obj, dict):
+                    obj[key] = url
             else:
                 logger.warning(
-                    "[%s] Failed to download media: empty response for code %s",
+                    "[%s] Empty download URL for media code %s",
                     self.name,
                     code,
                 )
         except Exception as e:
             logger.error("[%s] Error resolving media code %s: %s", self.name, code, e)
+
+    async def _fetch_file_attachment(
+        self, message: "ChatbotMessage"
+    ) -> Tuple[Optional[str], str, Optional[str]]:
+        """Download a ``msgtype=file`` attachment to the document cache.
+
+        The SDK's ``from_dict`` does not parse the ``file`` msgtype, so the
+        payload (``downloadCode`` + ``fileName``) lands in
+        ``message.extensions['content']`` verbatim. The download itself
+        reuses ``get_image_download_url`` — despite the name, that SDK
+        method hits ``/v1.0/robot/messageFiles/download`` which handles
+        files and pictures uniformly.
+
+        Returns ``(local_path, mime_type, file_name)``. Any failure yields
+        ``(None, _DEFAULT_FILE_MIME, file_name_if_known)`` so the caller
+        can still surface the filename in the text placeholder.
+
+        Known failure: some 企业内部应用 bot deployments get HTTP 500
+        ``unknownError`` from DingTalk when calling messageFiles/download.
+        That is a server-side issue, not fixable here — this method
+        degrades gracefully to returning None.
+        """
+        content = getattr(message, "extensions", {}) or {}
+        content = content.get("content") if isinstance(content, dict) else None
+        if not isinstance(content, dict):
+            return None, _DEFAULT_FILE_MIME, None
+
+        download_code = content.get("downloadCode")
+        file_name = content.get("fileName") or None
+        if not download_code or self._handler is None or self._http_client is None:
+            return None, _DEFAULT_FILE_MIME, file_name
+
+        try:
+            download_url = await asyncio.to_thread(
+                self._handler.get_image_download_url, download_code
+            )
+        except Exception:
+            logger.exception("[%s] get_image_download_url(file) failed", self.name)
+            return None, _DEFAULT_FILE_MIME, file_name
+        if not download_url:
+            logger.warning(
+                "[%s] No downloadUrl for file code %s…",
+                self.name, str(download_code)[:16],
+            )
+            return None, _DEFAULT_FILE_MIME, file_name
+
+        try:
+            # HEAD is not reliable on DingTalk CDN; streaming GET so we can
+            # reject oversized bodies via Content-Length before buffering.
+            async with self._http_client.stream("GET", download_url, timeout=60.0) as resp:
+                resp.raise_for_status()
+                declared = resp.headers.get("content-length")
+                if declared and declared.isdigit() and int(declared) > _MAX_FILE_BYTES:
+                    logger.warning(
+                        "[%s] File %s declared %s bytes > %d cap, skipping",
+                        self.name, file_name or "?", declared, _MAX_FILE_BYTES,
+                    )
+                    return None, _DEFAULT_FILE_MIME, file_name
+                chunks: List[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > _MAX_FILE_BYTES:
+                        logger.warning(
+                            "[%s] File %s exceeded %d bytes mid-stream, aborting",
+                            self.name, file_name or "?", _MAX_FILE_BYTES,
+                        )
+                        return None, _DEFAULT_FILE_MIME, file_name
+                    chunks.append(chunk)
+                content_type = resp.headers.get("content-type", "")
+        except httpx.HTTPError as e:
+            host = urlparse(download_url).hostname or "?"
+            logger.warning(
+                "[%s] File download failed (host=%s): %s",
+                self.name, host, e,
+            )
+            return None, _DEFAULT_FILE_MIME, file_name
+
+        data = b"".join(chunks)
+        if not data:
+            logger.warning("[%s] File download returned empty body", self.name)
+            return None, _DEFAULT_FILE_MIME, file_name
+
+        # Extension whitelist first, CDN content-type next (often lies as
+        # octet-stream for unknown ext), octet-stream last.
+        safe_name = file_name or "attachment.bin"
+        ext = Path(safe_name).suffix.lower()
+        mime = (
+            SUPPORTED_DOCUMENT_TYPES.get(ext)
+            or content_type.split(";")[0].strip()
+            or _DEFAULT_FILE_MIME
+        )
+
+        try:
+            local_path = Path(cache_document_from_bytes(data, safe_name)).as_posix()
+        except Exception as e:
+            logger.warning("[%s] Document cache failed: %s", self.name, e)
+            return None, _DEFAULT_FILE_MIME, file_name
+
+        return local_path, mime, file_name
 
     @staticmethod
     def _normalize_markdown(text: str) -> str:
