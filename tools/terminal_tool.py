@@ -1990,6 +1990,13 @@ def terminal_tool(
                     
                     logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
                                  max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+                    # Always include the full traceback at ERROR level so
+                    # OS-layer failures (e.g. Windows WinError 267 from a bad
+                    # cwd in subprocess.Popen) surface the offending frame
+                    # instead of just the exception type. Without this, every
+                    # diagnostic loop has to add ad-hoc instrumentation to
+                    # find which call site fed the bad path.
+                    logger.exception("Execution failed traceback")
                     return json.dumps({
                         "output": "",
                         "exit_code": -1,

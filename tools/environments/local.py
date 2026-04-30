@@ -15,22 +15,28 @@ _IS_WINDOWS = platform.system() == "Windows"
 
 
 # MSYS / Git-Bash drive paths look like `/d/Hermes_Agent` or `/c/Users/...`.
-# Windows subprocess.Popen rejects these for `cwd=` with WinError 267
+# WSL paths look like `/mnt/d/Hermes_Agent` or `/mnt/c/Users/...`.
+# Windows subprocess.Popen rejects either form for `cwd=` with WinError 267
 # (NotADirectoryError). Convert them to native form before they reach Popen.
+# `_find_bash` now avoids WSL outright, but the WSL branch stays as a
+# defensive fallback in case a path written by an earlier process (or by an
+# upstream caller that bypassed `_find_bash`) leaks through.
 _MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])(?:/(.*))?$")
+_WSL_DRIVE_RE = re.compile(r"^/mnt/([A-Za-z])(?:/(.*))?$")
 
 
 def _msys_to_windows_path(path: str) -> str:
-    """Translate `/d/foo/bar` style MSYS paths to `D:\\foo\\bar`.
+    """Translate `/d/foo/bar` (Git Bash) or `/mnt/d/foo/bar` (WSL) paths
+    to `D:\\foo\\bar`.
 
     No-op on non-Windows hosts and on paths that are already Windows-shaped
-    (drive letter + colon) or that don't match the MSYS drive pattern.
+    (drive letter + colon) or that don't match either POSIX-mount pattern.
     """
     if not _IS_WINDOWS or not path:
         return path
     if len(path) >= 2 and path[1] == ":":
         return path
-    m = _MSYS_DRIVE_RE.match(path)
+    m = _WSL_DRIVE_RE.match(path) or _MSYS_DRIVE_RE.match(path)
     if not m:
         return path
     drive = m.group(1).upper()
@@ -185,10 +191,12 @@ def _find_bash() -> str:
     if custom and os.path.isfile(custom):
         return custom
 
-    found = shutil.which("bash")
-    if found:
-        return found
-
+    # Prefer Git Bash over PATH lookup. `shutil.which("bash")` on Windows
+    # frequently hits `C:\Windows\System32\bash.exe`, which is the WSL
+    # launcher — that bash emits `/mnt/c/...` paths that `subprocess.Popen`
+    # cannot use as `cwd`, and Hermes's snapshot/marker scripts assume Git
+    # Bash semantics (MSYS-style mounts). Git Bash binaries get checked
+    # first; PATH lookup is only the last resort, and WSL is filtered out.
     for candidate in (
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
@@ -196,6 +204,10 @@ def _find_bash() -> str:
     ):
         if candidate and os.path.isfile(candidate):
             return candidate
+
+    found = shutil.which("bash")
+    if found and "system32" not in found.lower():
+        return found
 
     raise RuntimeError(
         "Git Bash not found. Hermes Agent requires Git for Windows on Windows.\n"

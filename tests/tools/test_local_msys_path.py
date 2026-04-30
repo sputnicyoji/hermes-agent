@@ -29,6 +29,21 @@ class TestMsysToWindowsPath:
             == "C:\\Users\\zhangxuechen"
         )
 
+    def test_converts_wsl_drive_path(self, windows_host):
+        # WSL bash emits `/mnt/c/...`. `_find_bash` avoids WSL, but the
+        # normalizer must still understand the form for callers that
+        # bypass `_find_bash` or persist a WSL path from a prior process.
+        assert (
+            _msys_to_windows_path("/mnt/c/Users/zhangxuechen")
+            == "C:\\Users\\zhangxuechen"
+        )
+
+    def test_converts_wsl_nested(self, windows_host):
+        assert (
+            _msys_to_windows_path("/mnt/d/Hermes_Agent")
+            == "D:\\Hermes_Agent"
+        )
+
     def test_drive_root_only(self, windows_host):
         assert _msys_to_windows_path("/c") == "C:\\"
         assert _msys_to_windows_path("/c/") == "C:\\"
