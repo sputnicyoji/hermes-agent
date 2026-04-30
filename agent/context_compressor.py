@@ -340,6 +340,8 @@ class ContextCompressor(ContextEngine):
         self._last_summary_error = None
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
+        self._last_aux_model_failure_error = None
+        self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
 
@@ -448,6 +450,12 @@ class ContextCompressor(ContextEngine):
         # (gateway hygiene, /compress) can surface a visible warning.
         self._last_summary_dropped_count: int = 0
         self._last_summary_fallback_used: bool = False
+        # When a user-configured summary model fails and we recover by
+        # retrying on the main model, record the failure so gateway /
+        # CLI callers can still warn the user even though compression
+        # succeeded.  Silent recovery would hide the broken config.
+        self._last_aux_model_failure_error: Optional[str] = None
+        self._last_aux_model_failure_model: Optional[str] = None
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -907,9 +915,49 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     "Falling back to main model '%s' for compression.",
                     self.summary_model, e, self.model,
                 )
+                # Record the aux-model failure so callers can warn the user
+                # even if the retry-on-main succeeds — a misconfigured aux
+                # model is something the user needs to fix.
+                _err_text = str(e).strip() or e.__class__.__name__
+                if len(_err_text) > 220:
+                    _err_text = _err_text[:217].rstrip() + "..."
+                self._last_aux_model_failure_error = _err_text
+                self._last_aux_model_failure_model = self.summary_model
                 self.summary_model = ""  # empty = use main model
                 self._summary_failure_cooldown_until = 0.0  # no cooldown
                 return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
+
+            # Unknown-error best-effort retry on main model.  Losing N turns of
+            # context is almost always worse than one extra summary attempt, so
+            # if we haven't already fallen back and the summary model differs
+            # from the main model, try once more on main before entering
+            # cooldown.  Errors that DID match _is_model_not_found above are
+            # already handled by the fast-path retry; this branch catches
+            # everything else (400s, provider-specific "no route" strings,
+            # aggregator rejections, etc.) where auto-retry is still safer
+            # than dropping the turns.
+            if (
+                self.summary_model
+                and self.summary_model != self.model
+                and not getattr(self, "_summary_model_fallen_back", False)
+            ):
+                self._summary_model_fallen_back = True
+                logging.warning(
+                    "Summary model '%s' failed (%s). "
+                    "Retrying on main model '%s' before giving up.",
+                    self.summary_model, e, self.model,
+                )
+                # Record the aux-model failure (see 404 branch above) — user
+                # should know their configured model is broken even if main
+                # recovers the call.
+                _err_text = str(e).strip() or e.__class__.__name__
+                if len(_err_text) > 220:
+                    _err_text = _err_text[:217].rstrip() + "..."
+                self._last_aux_model_failure_error = _err_text
+                self._last_aux_model_failure_model = self.summary_model
+                self.summary_model = ""  # empty = use main model
+                self._summary_failure_cooldown_until = 0.0
+                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
 
             # Transient errors (timeout, rate limit, network) — shorter cooldown
             _transient_cooldown = 60
@@ -1208,6 +1256,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
         self._last_summary_error = None
+        self._last_aux_model_failure_error = None
+        self._last_aux_model_failure_model = None
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self.protect_first_n + 3 + 1
