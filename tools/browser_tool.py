@@ -1550,6 +1550,19 @@ def _run_browser_command(
             idle_ms = str(BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
             browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = idle_ms
 
+        # Route the CLI at the bundled Playwright Chrome rather than the
+        # system Chrome. agent-browser 0.25.x and earlier default to
+        # whatever Chrome it finds in PATH, but stock Windows Chrome
+        # silently exits in ``--headless=new`` mode and never writes
+        # DevToolsActivePort. Playwright's build (downloaded via
+        # ``agent-browser install``) works.  Skip if the operator set
+        # the env var explicitly or if no Playwright build is on disk.
+        if "AGENT_BROWSER_EXECUTABLE_PATH" not in browser_env:
+            pw_chrome = _find_playwright_chrome_executable()
+            if pw_chrome:
+                browser_env["AGENT_BROWSER_EXECUTABLE_PATH"] = pw_chrome
+                logger.debug("agent-browser executable -> %s", pw_chrome)
+
         
         # Use temp files for stdout/stderr instead of pipes.
         # agent-browser starts a background daemon that inherits file
@@ -2820,6 +2833,76 @@ def _chromium_search_roots() -> List[str]:
         )
         roots.append(os.path.join(local, "ms-playwright"))
     return roots
+
+
+def _find_playwright_chrome_executable() -> Optional[str]:
+    """Locate the bundled Playwright Chrome / headless-shell binary.
+
+    agent-browser 0.25.x and below default to the system Chrome when
+    ``AGENT_BROWSER_EXECUTABLE_PATH`` isn't set. On Windows the system
+    Chrome (e.g. 147.0.7727.x) silently exits with code 0 in
+    ``--headless=new`` mode and never writes ``DevToolsActivePort``,
+    surfacing as "Chrome exited early" / "Daemon failed to start".
+    The Playwright build that ``agent-browser install`` downloads
+    works correctly, so route the CLI to it explicitly.
+
+    Walks the same search roots as ``_chromium_search_roots`` and
+    returns the highest-numbered build's chrome/chrome-headless-shell
+    binary on the current platform. Returns None when no Playwright
+    build is on disk — the caller should leave
+    ``AGENT_BROWSER_EXECUTABLE_PATH`` unset in that case.
+    """
+    # On Windows the Playwright "full" Chromium build silently exits (exit
+    # 0, no DevToolsActivePort) under ``--headless=new`` when launched by
+    # agent-browser; the chrome-headless-shell build doesn't. Prefer
+    # headless-shell on Windows. macOS / Linux can still use either; keep
+    # the full build first there for parity with Playwright's defaults.
+    if sys.platform == "win32":
+        candidates = (
+            ("chromium_headless_shell-", "chrome-headless-shell-win64", "chrome-headless-shell.exe"),
+            ("chromium-", "chrome-win64", "chrome.exe"),
+            ("chromium-", "chrome-win", "chrome.exe"),
+        )
+    elif sys.platform == "darwin":
+        candidates = (
+            ("chromium-", "chrome-mac/Chromium.app/Contents/MacOS", "Chromium"),
+            ("chromium_headless_shell-", "chrome-mac/headless_shell", "headless_shell"),
+        )
+    else:  # linux / other POSIX
+        candidates = (
+            ("chromium-", "chrome-linux", "chrome"),
+            ("chromium_headless_shell-", "chrome-linux", "headless_shell"),
+        )
+
+    # Walk candidates in priority order; the first prefix that has at
+    # least one usable build wins. Within that prefix, pick the highest
+    # build number so upgrades take effect when the previous build is
+    # still on disk. Mixing prefixes (e.g. preferring full Chromium just
+    # because it has a slightly newer build than headless-shell) would
+    # defeat the Windows priority above.
+    for prefix, subdir, exe in candidates:
+        best: Optional[tuple[int, str]] = None
+        for root in _chromium_search_roots():
+            if not root or not os.path.isdir(root):
+                continue
+            try:
+                entries = os.listdir(root)
+            except OSError:
+                continue
+            for entry in entries:
+                if not entry.startswith(prefix):
+                    continue
+                try:
+                    build = int(entry[len(prefix):])
+                except ValueError:
+                    continue
+                exe_path = os.path.join(root, entry, subdir, exe)
+                if os.path.isfile(exe_path):
+                    if best is None or build > best[0]:
+                        best = (build, exe_path)
+        if best is not None:
+            return best[1]
+    return None
 
 
 def _chromium_installed() -> bool:
