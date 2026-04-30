@@ -1498,8 +1498,17 @@ def _run_browser_command(
         # --session creates a local browser instance and silently ignores --cdp.
         backend_args = ["--cdp", session_info["cdp_url"]]
     else:
-        # Local mode — launch a headless Chromium instance
+        # Local mode — launch a headless Chromium instance.
+        # On Windows, Chromium's setuid sandbox doesn't work for the
+        # bundled Playwright build: Chrome exits immediately (exit 0)
+        # without writing DevToolsActivePort, surfaced as the unhelpful
+        # "Daemon failed to start" / "Chrome exited early" message.
+        # Force --no-sandbox via agent-browser's pass-through ``--args``
+        # so headless Chrome actually starts. Cloud/CDP mode is
+        # unaffected — the remote browser ignores local Chrome flags.
         backend_args = ["--session", session_info["session_name"]]
+        if sys.platform == "win32":
+            backend_args += ["--args", "--no-sandbox"]
 
     # Keep concrete executable paths intact, even when they contain spaces.
     # Only the synthetic npx fallback needs to expand into multiple argv items.
@@ -1540,6 +1549,7 @@ def _run_browser_command(
         if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in browser_env:
             idle_ms = str(BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
             browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = idle_ms
+
         
         # Use temp files for stdout/stderr instead of pipes.
         # agent-browser starts a background daemon that inherits file
