@@ -2,6 +2,7 @@
 
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -11,6 +12,32 @@ import time
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 
 _IS_WINDOWS = platform.system() == "Windows"
+
+
+# MSYS / Git-Bash drive paths look like `/d/Hermes_Agent` or `/c/Users/...`.
+# Windows subprocess.Popen rejects these for `cwd=` with WinError 267
+# (NotADirectoryError). Convert them to native form before they reach Popen.
+_MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])(?:/(.*))?$")
+
+
+def _msys_to_windows_path(path: str) -> str:
+    """Translate `/d/foo/bar` style MSYS paths to `D:\\foo\\bar`.
+
+    No-op on non-Windows hosts and on paths that are already Windows-shaped
+    (drive letter + colon) or that don't match the MSYS drive pattern.
+    """
+    if not _IS_WINDOWS or not path:
+        return path
+    if len(path) >= 2 and path[1] == ":":
+        return path
+    m = _MSYS_DRIVE_RE.match(path)
+    if not m:
+        return path
+    drive = m.group(1).upper()
+    rest = m.group(2) or ""
+    if not rest:
+        return f"{drive}:\\"
+    return f"{drive}:\\{rest.replace('/', os.sep)}"
 
 
 # Hermes-internal env vars that should NOT leak into terminal subprocesses.
@@ -435,12 +462,20 @@ class LocalEnvironment(BaseEnvironment):
             with open(self._cwd_file) as f:
                 cwd_path = f.read().strip()
             if cwd_path:
-                self.cwd = cwd_path
+                self.cwd = _msys_to_windows_path(cwd_path)
         except (OSError, FileNotFoundError):
             pass
 
         # Still strip the marker from output so it's not visible
         self._extract_cwd_from_output(result)
+
+    def _extract_cwd_from_output(self, result: dict):
+        # Base extraction parses the marker and assigns self.cwd directly.
+        # On Windows the value comes from `pwd -P` inside Git Bash, so it
+        # arrives as `/d/...`. Re-normalize after the base call so Popen
+        # gets a path Windows can chdir to.
+        super()._extract_cwd_from_output(result)
+        self.cwd = _msys_to_windows_path(self.cwd)
 
     def cleanup(self):
         """Clean up temp files."""
