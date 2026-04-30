@@ -65,6 +65,21 @@ class TestGetBackendChain:
             with patch("tools.web_tools._get_backend", return_value="firecrawl"):
                 assert _get_backend_chain() == ["firecrawl"]
 
+    def test_all_invalid_names_fall_through_to_legacy(self):
+        # If a user types an unknown name in `backend` and another
+        # unknown in `fallback_backends`, neither survives the
+        # known-backend filter. We must still produce a non-empty chain
+        # via the legacy auto-detect path; otherwise the tool would
+        # immediately surface a "no backend configured" error even
+        # though API keys are present.
+        from tools.web_tools import _get_backend_chain
+        with patch(
+            "tools.web_tools._load_web_config",
+            return_value={"backend": "bogus", "fallback_backends": ["also_bogus"]},
+        ):
+            with patch("tools.web_tools._get_backend", return_value="exa"):
+                assert _get_backend_chain() == ["exa"]
+
 
 # ─── web_search_tool fallback ───────────────────────────────────────────────
 
@@ -172,6 +187,47 @@ class TestWebExtractFallback:
 
         assert call_log == ["exa", "tavily"]
         assert result["results"][0]["title"] == "from tavily"
+
+    def test_firecrawl_all_urls_fail_triggers_fallback(self):
+        # firecrawl absorbs per-URL errors into the result list rather
+        # than raising. The all-URLs-failed guard at the end of
+        # _firecrawl_extract_async lets a chain like [firecrawl, tavily]
+        # fall through when the account is out of credits.  Drive the
+        # real _firecrawl_extract_async (so the guard runs) while
+        # forcing every scrape to fail at the SDK boundary.
+        from tools import web_tools
+
+        firecrawl_client = MagicMock()
+        firecrawl_client.scrape.side_effect = RuntimeError("HTTP 402 Payment Required")
+
+        async def fake_tavily(backend, urls, fmt):
+            assert backend == "tavily"
+            return [{"url": urls[0], "title": "from tavily", "content": "body", "metadata": {}}]
+
+        original_dispatch = web_tools._extract_with_backend
+
+        async def selective_dispatch(backend, urls, fmt):
+            if backend == "firecrawl":
+                return await original_dispatch(backend, urls, fmt)
+            return await fake_tavily(backend, urls, fmt)
+
+        with patch.object(web_tools, "_get_backend_chain", return_value=["firecrawl", "tavily"]):
+            with patch.object(web_tools, "_get_firecrawl_client", return_value=firecrawl_client):
+                with patch.object(web_tools, "check_website_access", return_value=None):
+                    with patch.object(
+                        web_tools, "_extract_with_backend",
+                        side_effect=selective_dispatch,
+                    ):
+                        result = json.loads(asyncio.run(
+                            web_tools.web_extract_tool(
+                                urls=["https://example.com"],
+                                use_llm_processing=False,
+                            )
+                        ))
+
+        assert result["results"][0]["title"] == "from tavily"
+        # And firecrawl really was attempted (the SDK was called once).
+        assert firecrawl_client.scrape.call_count == 1
 
     def test_all_backends_fail_emits_per_url_error(self):
         from tools import web_tools

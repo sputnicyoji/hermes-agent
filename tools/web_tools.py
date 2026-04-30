@@ -191,6 +191,34 @@ def _get_backend_chain() -> List[str]:
     return chain
 
 
+def _log_backend_failure(tool_name: str, backend: str, exc: Exception) -> None:
+    """Single source of truth for per-backend chain-loop failure logs.
+
+    Pulled out so ``web_search_tool`` and ``web_extract_tool`` can never
+    drift apart on log shape — operators grepping ``backend %s failed``
+    across both tools should get a uniform record.
+    """
+    logger.warning(
+        "%s backend %s failed (%s: %s) — trying next",
+        tool_name, backend, type(exc).__name__, exc,
+    )
+
+
+def _chain_exhausted_message(
+    tool_name: str, attempts: List[str], last_error: Optional[Exception]
+) -> str:
+    """Aggregated error returned when every backend in the chain raised.
+
+    The chain itself appears in the message so a misconfigured
+    ``fallback_backends`` list shows up in the agent's error rather than
+    only in the gateway log.
+    """
+    return (
+        f"All {tool_name} backends failed (tried {', '.join(attempts) or 'none'}): "
+        f"{type(last_error).__name__ if last_error else 'NoBackendConfigured'}: {last_error}"
+    )
+
+
 def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable."""
     if backend == "exa":
@@ -1145,6 +1173,8 @@ async def _extract_with_backend(
         )
     if backend == "firecrawl":
         return await _firecrawl_extract_async(safe_urls, format)
+    # See _search_with_backend — unreachable in normal flow, kept as a
+    # safety net.
     raise ValueError(f"Unknown web_extract backend: {backend!r}")
 
 
@@ -1258,6 +1288,26 @@ async def _firecrawl_extract_async(
                 "error": str(scrape_err),
             })
 
+    # If every URL produced an error entry with no content, treat the
+    # whole batch as a backend-level failure so the chain loop can fall
+    # through to the next backend. This is the firecrawl-out-of-credits
+    # case (every scrape returns 402): without raising here, mid-chain
+    # firecrawl would silently absorb the failure and never fall back.
+    # Per-URL policy blocks (``blocked_by_policy``) and interrupts are
+    # excluded — those are real per-URL outcomes, not backend failures.
+    if results and all(
+        r.get("error")
+        and not r.get("content")
+        and "blocked_by_policy" not in r
+        and r.get("error") != "Interrupted"
+        for r in results
+    ):
+        first_error = results[0].get("error", "unknown")
+        raise RuntimeError(
+            f"Firecrawl: all {len(results)} URL(s) failed to extract — "
+            f"first error: {first_error}"
+        )
+
     return results
 
 
@@ -1327,19 +1377,12 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             try:
                 response_data = _search_with_backend(backend, query, limit)
             except Exception as exc:
-                # Any failure on this backend — payment required, rate
-                # limit, network error, invalid key, transient 5xx —
-                # gets logged and we move on to the next backend in the
-                # chain. The previous behaviour bubbled the first error
-                # straight to the agent, defeating the whole point of a
-                # multi-backend fallback list. Truly systemic exceptions
-                # (KeyboardInterrupt, SystemExit, asyncio.CancelledError)
-                # subclass BaseException, not Exception, and keep
-                # propagating.
-                logger.warning(
-                    "web_search backend %s failed (%s: %s) — trying next",
-                    backend, type(exc).__name__, exc,
-                )
+                # Any non-systemic exception (rate limit, payment
+                # required, network error, invalid key, transient 5xx)
+                # falls through to the next backend.  KeyboardInterrupt,
+                # SystemExit, asyncio.CancelledError subclass
+                # BaseException, not Exception, and keep propagating.
+                _log_backend_failure("web_search", backend, exc)
                 last_error = exc
                 continue
 
@@ -1353,15 +1396,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             _debug.save()
             return result_json
 
-        # Every backend in the chain failed. Surface the chain itself
-        # plus the last error so the agent can see what was tried — a
-        # generic "Error searching web" hides a misconfigured fallback
-        # list, which is exactly the failure mode that motivated this
-        # refactor.
-        error_msg = (
-            f"All web search backends failed (tried {', '.join(attempts) or 'none'}): "
-            f"{type(last_error).__name__ if last_error else 'NoBackendConfigured'}: {last_error}"
-        )
+        error_msg = _chain_exhausted_message("web_search", attempts, last_error)
         logger.error("%s", error_msg)
         debug_call_data["error"] = error_msg
         _debug.log_call("web_search_tool", debug_call_data)
@@ -1405,6 +1440,9 @@ def _search_with_backend(backend: str, query: str, limit: int) -> dict:
         web_results = _extract_web_search_results(response)
         logger.info("Found %d search results", len(web_results))
         return {"success": True, "data": {"web": web_results}}
+    # Unreachable while the caller resolves the chain through
+    # ``_get_backend_chain`` (which filters against ``_KNOWN_BACKENDS``).
+    # Kept as a safety net in case a future caller bypasses that filter.
     raise ValueError(f"Unknown web search backend: {backend!r}")
 
 
@@ -1504,22 +1542,14 @@ async def web_extract_tool(
                     debug_call_data["backend_used"] = backend
                     break
                 except Exception as exc:
-                    logger.warning(
-                        "web_extract backend %s failed (%s: %s) — trying next",
-                        backend, type(exc).__name__, exc,
-                    )
+                    _log_backend_failure("web_extract", backend, exc)
                     last_error = exc
                     continue
             if results is None:
-                # Every backend in the chain raised. Surface as per-URL
-                # error entries so the rest of the pipeline (LLM
-                # post-processing, debug payload) keeps the existing
-                # ``response = {"results": [...]}`` shape.
-                err_label = (
-                    f"All web_extract backends failed (tried "
-                    f"{', '.join(attempts) or 'none'}): "
-                    f"{type(last_error).__name__ if last_error else 'NoBackendConfigured'}: {last_error}"
-                )
+                # Every backend in the chain raised. Surface per-URL
+                # error entries so the LLM post-processing pipeline
+                # keeps the existing ``response = {"results": [...]}`` shape.
+                err_label = _chain_exhausted_message("web_extract", attempts, last_error)
                 logger.error("%s", err_label)
                 results = [
                     {"url": url, "title": "", "content": "", "raw_content": "", "error": err_label}
