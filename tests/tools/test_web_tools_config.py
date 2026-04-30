@@ -505,23 +505,26 @@ class TestWebSearchErrorHandling:
         firecrawl_client = MagicMock()
         firecrawl_client.search.side_effect = RuntimeError("boom")
 
-        with patch("tools.web_tools._get_backend", return_value="firecrawl"), \
+        with patch("tools.web_tools._get_backend_chain", return_value=["firecrawl"]), \
              patch("tools.web_tools._get_firecrawl_client", return_value=firecrawl_client), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch.object(tools.web_tools._debug, "log_call") as mock_log_call, \
              patch.object(tools.web_tools._debug, "save"):
             result = json.loads(tools.web_tools.web_search_tool("test query", limit=3))
 
-        assert result == {"error": "Error searching web: boom"}
+        # The chain-aware error wraps the underlying exception type and
+        # message but must not leak traceback / config / chain
+        # internals. Match shape, not exact string, so the message can
+        # evolve without breaking this contract.
+        assert set(result.keys()) == {"error"}
+        assert "boom" in result["error"]
+        assert "firecrawl" in result["error"]
 
         debug_payload = mock_log_call.call_args.args[1]
-        assert debug_payload["error"] == "Error searching web: boom"
-        assert "traceback" not in debug_payload["error"]
-        assert "exception_type" not in debug_payload["error"]
-        assert "config" not in result
-        assert "exception_type" not in result
-        assert "exception_chain" not in result
-        assert "traceback" not in result
+        assert "boom" in debug_payload["error"]
+        assert "traceback" not in debug_payload["error"].lower()
+        assert "config" not in result["error"].lower()
+        assert "exception_chain" not in result["error"].lower()
 
 
 class TestCheckWebApiKey:
