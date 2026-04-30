@@ -342,6 +342,20 @@ class LocalEnvironment(BaseEnvironment):
         super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
         self.init_session()
 
+    # Single normalization point for self.cwd. Both write paths
+    # (`_update_cwd` reading the cwd file, and `_extract_cwd_from_output`
+    # in the base class parsing the stdout marker) end up going through
+    # this setter, so MSYS-style paths from `pwd -P` inside Git Bash get
+    # translated to native Windows form before any subprocess.Popen sees
+    # them. No-op on non-Windows hosts.
+    @property
+    def cwd(self) -> str:
+        return self._cwd
+
+    @cwd.setter
+    def cwd(self, value: str) -> None:
+        self._cwd = _msys_to_windows_path(value)
+
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
 
@@ -462,20 +476,12 @@ class LocalEnvironment(BaseEnvironment):
             with open(self._cwd_file) as f:
                 cwd_path = f.read().strip()
             if cwd_path:
-                self.cwd = _msys_to_windows_path(cwd_path)
+                self.cwd = cwd_path
         except (OSError, FileNotFoundError):
             pass
 
         # Still strip the marker from output so it's not visible
         self._extract_cwd_from_output(result)
-
-    def _extract_cwd_from_output(self, result: dict):
-        # Base extraction parses the marker and assigns self.cwd directly.
-        # On Windows the value comes from `pwd -P` inside Git Bash, so it
-        # arrives as `/d/...`. Re-normalize after the base call so Popen
-        # gets a path Windows can chdir to.
-        super()._extract_cwd_from_output(result)
-        self.cwd = _msys_to_windows_path(self.cwd)
 
     def cleanup(self):
         """Clean up temp files."""

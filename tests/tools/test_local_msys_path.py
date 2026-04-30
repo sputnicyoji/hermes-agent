@@ -6,11 +6,10 @@ cannot be passed to `subprocess.Popen(cwd=...)` directly — Windows raises
 back to native form before they leak into self.cwd.
 """
 
-from unittest.mock import patch
-
 import pytest
 
 from tools.environments import local as local_mod
+from tools.environments.base import _cwd_marker
 from tools.environments.local import _msys_to_windows_path
 
 
@@ -63,19 +62,26 @@ class TestMsysToWindowsPath:
         assert _msys_to_windows_path("/d/Hermes_Agent") == "/d/Hermes_Agent"
 
 
-class TestUpdateCwdNormalizesMsysPath:
-    """`_update_cwd` reads the cwd file written by `pwd -P` and assigns it
-    to self.cwd. On Windows that value must be normalized before any
-    subsequent Popen call uses it.
+class TestCwdSetterNormalizes:
+    """Assigning to `LocalEnvironment.cwd` routes through the property
+    setter so MSYS paths from any source — file, stdout marker, direct
+    assignment — all get normalized at the single write boundary.
     """
 
-    def _make_env_without_init(self):
+    def _make_env_without_init(self, session_id: str = "test"):
         # Bypass __init__ + init_session so we can drive _update_cwd in
-        # isolation without spawning bash.
+        # isolation without spawning bash. _update_cwd currently depends
+        # on these instance attributes: cwd (property), _cwd_marker,
+        # _cwd_file. If that list grows, this fixture must too.
         env = local_mod.LocalEnvironment.__new__(local_mod.LocalEnvironment)
-        env.cwd = "D:\\Hermes_Agent"
-        env._cwd_marker = "__HERMES_CWD_test__"
+        env._cwd = "D:\\seed"
+        env._cwd_marker = _cwd_marker(session_id)
         return env
+
+    def test_setter_normalizes_direct_assignment(self, windows_host):
+        env = self._make_env_without_init()
+        env.cwd = "/d/Hermes_Agent"
+        assert env.cwd == "D:\\Hermes_Agent"
 
     def test_file_source_normalized(self, windows_host, tmp_path):
         env = self._make_env_without_init()
