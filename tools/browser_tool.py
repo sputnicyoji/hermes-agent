@@ -1272,9 +1272,65 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     return session_info
 
 
+def _resolve_npm_shim_to_native(shim_path: str) -> str:
+    """Swap an npm-generated ``.cmd`` shim for the bundled native exe on Windows.
+
+    Background: ``agent-browser``'s package.json points its bin entry
+    at ``bin/agent-browser`` — a POSIX shell script with a
+    ``#!/bin/sh`` shebang. When npm installs the package on Windows it
+    auto-generates a ``.cmd`` shim that invokes ``/bin/sh`` to run the
+    script. Native Windows has no ``/bin/sh``; the shim exits with
+    Windows error 3 (``ERROR_PATH_NOT_FOUND``) — surfaced to the agent
+    as the cryptic "The system cannot find the path specified".
+
+    The package itself ships ``bin/agent-browser-win32-x64.exe`` (and
+    a ``-darwin-arm64`` etc. for other hosts), which works fine when
+    invoked directly. This helper detects an npm shim — by suffix and
+    by content sniff — and swaps it for the platform-native exe in
+    the same package's ``bin/`` directory.
+
+    Falls back to the original path on non-Windows hosts, when the
+    suffix doesn't match, or when the native exe isn't where we
+    expect it. Cached at the call site, so the cost is one stat per
+    process.
+    """
+    if sys.platform != "win32":
+        return shim_path
+
+    if not shim_path.lower().endswith((".cmd", ".bat")):
+        return shim_path
+
+    # Map the npm install root (..\npm\agent-browser.CMD or
+    # ..\npm\node_modules\.bin\agent-browser.CMD) to the package
+    # bin/ directory.
+    shim_dir = os.path.dirname(shim_path)
+    candidate_roots = [
+        os.path.join(shim_dir, "node_modules", "agent-browser", "bin"),
+        # node_modules/.bin shim → ../agent-browser/bin
+        os.path.join(shim_dir, "..", "agent-browser", "bin"),
+    ]
+    arch = "arm64" if os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() in ("arm64",) else "x64"
+    exe_name = f"agent-browser-win32-{arch}.exe"
+
+    for root in candidate_roots:
+        native = os.path.normpath(os.path.join(root, exe_name))
+        if os.path.isfile(native):
+            logger.debug(
+                "agent-browser: replacing npm shim %s with native %s",
+                shim_path, native,
+            )
+            return native
+
+    return shim_path
+
+
 
 def _find_agent_browser() -> str:
     """
+    See ``_resolve_npm_shim_to_native`` below — Windows callers go
+    through that to swap npm's broken sh-shim for the bundled
+    platform-native exe whenever possible.
+
     Find the agent-browser CLI executable.
     
     Checks in order: current PATH, Homebrew/common bin dirs, Hermes-managed
@@ -1304,6 +1360,7 @@ def _find_agent_browser() -> str:
     # Check if it's in PATH (global install)
     which_result = shutil.which("agent-browser")
     if which_result:
+        which_result = _resolve_npm_shim_to_native(which_result)
         _cached_agent_browser = which_result
         _agent_browser_resolved = True
         return which_result
@@ -1314,6 +1371,7 @@ def _find_agent_browser() -> str:
     if extended_path:
         which_result = shutil.which("agent-browser", path=extended_path)
         if which_result:
+            which_result = _resolve_npm_shim_to_native(which_result)
             _cached_agent_browser = which_result
             _agent_browser_resolved = True
             return which_result
@@ -1322,7 +1380,7 @@ def _find_agent_browser() -> str:
     repo_root = Path(__file__).parent.parent
     local_bin = repo_root / "node_modules" / ".bin" / "agent-browser"
     if local_bin.exists():
-        _cached_agent_browser = str(local_bin)
+        _cached_agent_browser = _resolve_npm_shim_to_native(str(local_bin))
         _agent_browser_resolved = True
         return _cached_agent_browser
     
