@@ -201,6 +201,8 @@ python -c "import xml.etree.ElementTree as ET; tree = ET.parse('$ARXIV_TMP'); ..
 
 Dedupe key: `arxiv_id` with version stripped (`2605.04039`). The arxiv API has a soft "1 request every 3 seconds" rule — single call per cron run is well within.
 
+**Time-window override for arxiv (daily mode):** use **48h** instead of the global 24h, because researchers don't submit on weekends — Mon/Tue runs against a 24h window often come back empty even on busy weeks. Weekly mode keeps its 7d window. Filter client-side by `published` field after fetching.
+
 ### 6. Hacker News (Algolia search backend)
 
 ```bash
