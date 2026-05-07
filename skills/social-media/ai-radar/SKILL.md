@@ -21,7 +21,7 @@ metadata:
 Pulls fresh signal from 6 public sources, dedupes against persistent state, scores with an LLM, and ships a compact digest to DingTalk. Designed to run as a cron job (`5 9 * * 1-6` for daily, `10 9 * * 0` for weekly), but can be invoked manually too.
 
 The digest answers two questions:
-1. **What shipped in AI since last run?** — top 6-8 items across news, repos, models, papers
+1. **What shipped in AI since last run?** — top 10 items across news, repos, models, papers
 2. **Who should the user follow on X to keep up?** — 0-3 candidates with reasons; user confirms via DingTalk reply, not auto-followed
 
 The skill never executes write actions (`twitter follow`, `twitter post`, etc.) on its own. See **Write authorization** below.
@@ -45,7 +45,7 @@ The skill should NOT trigger for:
 
 | Mode | Triggered by | Time window | Output |
 |------|--------------|-------------|--------|
-| `daily` (default) | cron `5 9 * * 1-6`, or manual ask | last 24h since `state.last_run_iso` (or 36h if missed) | 6-8 items + ≤3 follow candidates |
+| `daily` (default) | cron `5 9 * * 1-6`, or manual ask | last 24h since `state.last_run_iso` (or 36h if missed) | 10 items + ≤3 follow candidates |
 | `weekly` | cron `10 9 * * 0`, or manual "周报" | last 7 days | 12-15 items + 5-sentence trend summary + ≤5 follow candidates |
 | `catchup` | "我 N 天没看了" | last N days, custom | proportional |
 
@@ -278,7 +278,7 @@ Items:
 Use `deepseek-v4-pro` (the configured main model). One call ≈ 800 input + 400 output tokens for a 30-item batch ≈ $0.0003. Cheap.
 
 Selection rules:
-- `daily`: top 6-8 by score, **diversity constraint**: max 3 from any single source, max 2 from any single author
+- `daily`: top 10 by score, **diversity constraint**: max 4 from any single source, max 2 from any single author
 - `weekly`: top 12-15, same diversity constraint relaxed (max 5 / 3)
 
 ---
@@ -344,7 +344,7 @@ Don't pad — if an item only has 2 lines of real content, stop at 2. Filler ("�
 📡 AI Radar — 2026-05-07 daily
 
 
-🔥 Top 6
+🔥 Top 10
 
 1. [HN ▲187] Programming Is Real Engineering, and AI Proves It
    https://news.ycombinator.com/item?id=...
@@ -362,7 +362,7 @@ Don't pad — if an item only has 2 lines of real content, stop at 2. Filler ("�
    https://x.com/kaiokendev/status/...
    ↳ 引用推文一句话核心观点
 
-... (6-8 total)
+... (10 total)
 
 
 🧠 本周趋势 (weekly only)
@@ -385,13 +385,13 @@ Don't pad — if an item only has 2 lines of real content, stop at 2. Filler ("�
 
 ### Length
 
-Target **≤ 3000 chars total** (DingTalk text messages support up to ~5000 — keep headroom). With 2-4 lines per `↳` block:
+Target **≤ 4000 chars total** (DingTalk text messages support up to ~5000 — keep headroom). With 2-4 lines per `↳` block:
 
-- 8 items × ~250 chars/item ≈ 2000 chars body
-- + sources / candidates / header ≈ 500 chars
-- comfortable fit at ~2500 chars
+- 10 items × ~300 chars/item ≈ 3000 chars body
+- + sources / candidates / header ≈ 800 chars
+- comfortable fit at ~3800 chars
 
-If you're hitting the cap, cut **items**, not field depth. Six well-explained items beat ten cramped ones. Drop bottom-ranked first; never compress the `↳` to a single line just to fit more items.
+If you're hitting the cap, cut **items**, not field depth. Eight well-explained items beat twelve cramped ones. Drop bottom-ranked first; never compress the `↳` to a single line just to fit more items.
 
 ### When X feed comes back too thin
 
@@ -458,7 +458,7 @@ Why: cron is unattended; following is a public, hard-to-reverse action that affe
 
 - **Hard cap** on items per source per run: 30. More than that is noise.
 - **Hard cap** on follow candidates suggested per run: 5 (weekly), 3 (daily).
-- **Hard cap** on total digest length: 3000 chars (matches the `Length` section above; DingTalk text messages support ~5000 so this leaves headroom).
+- **Hard cap** on total digest length: 4000 chars (matches the `Length` section above; DingTalk text messages support ~5000 so this leaves headroom).
 - Don't dump raw tweet text into the digest — summarize. Raw text in cron-pushed messages risks re-broadcasting copyright-shaped content.
 - Don't include the user's own tweet IDs from `seen_tweet_ids` in any output (privacy hygiene).
 - Don't call any source more than once per run except for the targeted X searches (max 3 search queries).
