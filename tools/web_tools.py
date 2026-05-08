@@ -118,11 +118,17 @@ def _load_web_config() -> dict:
     except (ImportError, Exception):
         return {}
 
-_KNOWN_BACKENDS = ("parallel", "firecrawl", "tavily", "exa")
+_KNOWN_BACKENDS = (
+    "parallel", "firecrawl", "tavily", "exa",
+    "searxng", "brave-free", "ddgs",
+)
+# Backends that support search but not URL extraction.
+# _extract_with_backend raises a typed error for these so the chain falls through.
+_SEARCH_ONLY_BACKENDS = frozenset({"searxng", "brave-free", "ddgs"})
 
 
 def _get_backend() -> str:
-    """Determine which web backend to use (primary only).
+    """Determine which web backend to use (primary / shared fallback).
 
     Reads ``web.backend`` from config.yaml (set by ``hermes tools``).
     Falls back to whichever API key is present for users who configured
@@ -135,11 +141,16 @@ def _get_backend() -> str:
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Firecrawl also counts as available when the managed
     # tool gateway is configured for Nous subscribers.
+    # Free-tier backends (searxng / brave-free / ddgs) trail the paid ones so
+    # existing paid setups are unaffected.
     backend_candidates = (
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
+        ("searxng", _has_env("SEARXNG_URL")),
+        ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
+        ("ddgs", _ddgs_package_importable()),
     )
     for backend, available in backend_candidates:
         if available:
@@ -148,11 +159,14 @@ def _get_backend() -> str:
     return "firecrawl"  # default (backward compat)
 
 
-def _get_backend_chain() -> List[str]:
+def _get_backend_chain(capability: Optional[str] = None) -> List[str]:
     """Return the ordered list of backends to try for a single tool call.
 
-    The first entry is the primary (``web.backend``); the remainder come
-    from ``web.fallback_backends`` (a list, in order). Duplicates and
+    The first entry is the per-capability primary
+    (``web.search_backend`` / ``web.extract_backend``) when configured,
+    falling back to the shared ``web.backend``. The remainder come from
+    ``web.{capability}_fallback_backends`` (preferred) or the legacy
+    shared ``web.fallback_backends`` (a list, in order). Duplicates and
     unknown names are dropped. When neither is configured, the chain
     contains a single entry — whatever ``_get_backend()`` resolves to —
     preserving the pre-fallback behaviour.
@@ -160,28 +174,44 @@ def _get_backend_chain() -> List[str]:
     Example config:
 
         web:
-          backend: exa
+          search_backend: searxng
+          extract_backend: firecrawl
           fallback_backends:
             - tavily
+            - exa
 
     Each call site walks the chain in order, swallows non-systemic
     exceptions from each backend (rate limit, payment required, network
     error, etc.) and only surfaces an error when every backend fails.
     """
     cfg = _load_web_config()
-    primary = (cfg.get("backend") or "").lower().strip()
-    raw_fallbacks = cfg.get("fallback_backends") or []
+
+    # Primary: prefer per-capability override, fall back to shared web.backend.
+    # Route through the named wrapper so monkeypatching
+    # _get_search_backend / _get_extract_backend in tests still observes calls.
+    if capability == "search":
+        primary = _get_search_backend()
+    elif capability == "extract":
+        primary = _get_extract_backend()
+    elif capability:
+        primary = _get_capability_backend(capability)
+    else:
+        primary = (cfg.get("backend") or "").lower().strip()
+        if primary not in _KNOWN_BACKENDS:
+            primary = _get_backend()
+
+    # Fallbacks: per-capability list takes precedence over shared list.
+    raw_fallbacks: Any = None
+    if capability:
+        raw_fallbacks = cfg.get(f"{capability}_fallback_backends")
+    if not raw_fallbacks:
+        raw_fallbacks = cfg.get("fallback_backends") or []
     if isinstance(raw_fallbacks, str):
         raw_fallbacks = [raw_fallbacks]
 
     chain: List[str] = []
-
     if primary in _KNOWN_BACKENDS:
         chain.append(primary)
-    else:
-        # No primary explicitly configured — fall back to the legacy
-        # auto-detect logic so single-backend deployments behave as before.
-        chain.append(_get_backend())
 
     for entry in raw_fallbacks:
         name = str(entry or "").lower().strip()
@@ -219,6 +249,44 @@ def _chain_exhausted_message(
     )
 
 
+def _get_search_backend() -> str:
+    """Determine which backend to use for web_search specifically.
+
+    Selection priority:
+    1. ``web.search_backend`` (per-capability override)
+    2. ``web.backend`` (shared fallback — existing behavior)
+    3. Auto-detect from env vars
+
+    This enables using different providers for search vs extract
+    (e.g. SearXNG for search + Firecrawl for extract).
+    """
+    return _get_capability_backend("search")
+
+
+def _get_extract_backend() -> str:
+    """Determine which backend to use for web_extract specifically.
+
+    Selection priority:
+    1. ``web.extract_backend`` (per-capability override)
+    2. ``web.backend`` (shared fallback — existing behavior)
+    3. Auto-detect from env vars
+    """
+    return _get_capability_backend("extract")
+
+
+def _get_capability_backend(capability: str) -> str:
+    """Shared helper for per-capability backend selection.
+
+    Reads ``web.{capability}_backend`` from config; if set and available,
+    uses it. Otherwise falls through to the shared ``_get_backend()``.
+    """
+    cfg = _load_web_config()
+    specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
+    if specific and _is_backend_available(specific):
+        return specific
+    return _get_backend()
+
+
 def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable."""
     if backend == "exa":
@@ -229,7 +297,28 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "searxng":
+        return _has_env("SEARXNG_URL")
+    if backend == "brave-free":
+        return _has_env("BRAVE_SEARCH_API_KEY")
+    if backend == "ddgs":
+        return _ddgs_package_importable()
     return False
+
+
+def _ddgs_package_importable() -> bool:
+    """Return True when the ``ddgs`` Python package can be imported.
+
+    ddgs is the only backend whose availability is driven by a package
+    presence rather than an env var / config entry.  Wrapped in a helper
+    so auto-detect and ``_is_backend_available`` share the same check
+    (and tests can monkeypatch a single symbol).
+    """
+    try:
+        import ddgs  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
 
@@ -1175,6 +1264,21 @@ async def _extract_with_backend(
         )
     if backend == "firecrawl":
         return await _firecrawl_extract_async(safe_urls, format)
+    if backend in _SEARCH_ONLY_BACKENDS:
+        # Search-only providers (searxng / brave-free / ddgs) cannot extract
+        # URL content. Raise so the chain falls through to the next entry,
+        # rather than returning empty results that the LLM might mistake
+        # for a successful but empty extraction.
+        _label = {
+            "searxng": "SearXNG",
+            "brave-free": "Brave Search (free tier)",
+            "ddgs": "DuckDuckGo (ddgs)",
+        }[backend]
+        raise NotImplementedError(
+            f"{_label} is a search-only backend and cannot extract URL content. "
+            "Configure web.extract_backend or list firecrawl/tavily/exa/parallel "
+            "in web.fallback_backends."
+        )
     # See _search_with_backend — unreachable in normal flow, kept as a
     # safety net.
     raise ValueError(f"Unknown web_extract backend: {backend!r}")
@@ -1369,7 +1473,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
-        chain = _get_backend_chain()
+        chain = _get_backend_chain("search")
         debug_call_data["backend_chain"] = chain
         last_error: Optional[Exception] = None
         attempts: List[str] = []
@@ -1442,6 +1546,15 @@ def _search_with_backend(backend: str, query: str, limit: int) -> dict:
         web_results = _extract_web_search_results(response)
         logger.info("Found %d search results", len(web_results))
         return {"success": True, "data": {"web": web_results}}
+    if backend == "searxng":
+        from tools.web_providers.searxng import SearXNGSearchProvider
+        return SearXNGSearchProvider().search(query, limit)
+    if backend == "brave-free":
+        from tools.web_providers.brave_free import BraveFreeSearchProvider
+        return BraveFreeSearchProvider().search(query, limit)
+    if backend == "ddgs":
+        from tools.web_providers.ddgs import DDGSSearchProvider
+        return DDGSSearchProvider().search(query, limit)
     # Unreachable while the caller resolves the chain through
     # ``_get_backend_chain`` (which filters against ``_KNOWN_BACKENDS``).
     # Kept as a safety net in case a future caller bypasses that filter.
@@ -1532,8 +1645,30 @@ async def web_extract_tool(
         if not safe_urls:
             results = []
         else:
-            chain = _get_backend_chain()
+            chain = _get_backend_chain("extract")
             debug_call_data["backend_chain"] = chain
+
+            # Fail-fast for misconfigured extract chains: if every backend
+            # in the chain is search-only, returning the chain-exhausted
+            # per-URL error list would obscure the real problem (config).
+            # Surface a clear, actionable error JSON instead — matches the
+            # behaviour upstream uses when only search-only backends are
+            # configured.
+            if chain and all(b in _SEARCH_ONLY_BACKENDS for b in chain):
+                primary = chain[0]
+                _label = {
+                    "searxng": "SearXNG",
+                    "brave-free": "Brave Search (free tier)",
+                    "ddgs": "DuckDuckGo (ddgs)",
+                }[primary]
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        f"{_label} is a search-only backend and cannot extract URL content. "
+                        "Set web.extract_backend to firecrawl, tavily, exa, or parallel."
+                    ),
+                }, ensure_ascii=False)
+
             results = None
             last_error: Optional[Exception] = None
             attempts: List[str] = []
@@ -1827,6 +1962,15 @@ async def web_crawl_tool(
             _debug.log_call("web_crawl_tool", debug_call_data)
             _debug.save()
             return cleaned_result
+
+        # SearXNG / Brave Search (free tier) / DuckDuckGo (ddgs) are search-only — they cannot crawl
+        if backend in ("searxng", "brave-free", "ddgs"):
+            _label = {"searxng": "SearXNG", "brave-free": "Brave Search (free tier)", "ddgs": "DuckDuckGo (ddgs)"}[backend]
+            return json.dumps({
+                "error": f"{_label} is a search-only backend and cannot crawl URLs. "
+                         "Set FIRECRAWL_API_KEY for crawling, or use web_search instead.",
+                "success": False,
+            }, ensure_ascii=False)
 
         # web_crawl requires Firecrawl or the Firecrawl tool-gateway — Parallel has no crawl API
         if not check_firecrawl_api_key():
@@ -2123,9 +2267,12 @@ def check_firecrawl_api_key() -> bool:
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in ("exa", "parallel", "firecrawl", "tavily"):
+    if configured in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs"):
         return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
+    return any(
+        _is_backend_available(backend)
+        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs")
+    )
 
 
 def check_auxiliary_model() -> bool:
@@ -2160,6 +2307,12 @@ if __name__ == "__main__":
             print("   Using Parallel API (https://parallel.ai)")
         elif backend == "tavily":
             print("   Using Tavily API (https://tavily.com)")
+        elif backend == "searxng":
+            print(f"   Using SearXNG (search only): {os.getenv('SEARXNG_URL', '').strip()}")
+        elif backend == "brave-free":
+            print("   Using Brave Search free tier (search only)")
+        elif backend == "ddgs":
+            print("   Using DuckDuckGo via ddgs package (search only)")
         else:
             if firecrawl_url_available:
                 print(f"   Using self-hosted Firecrawl: {os.getenv('FIRECRAWL_API_URL').strip().rstrip('/')}")
