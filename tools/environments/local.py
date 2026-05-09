@@ -207,8 +207,25 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     return sanitized
 
 
+_CACHED_BASH: "str | None" = None
+
+
 def _find_bash() -> str:
-    """Find bash for command execution."""
+    """Find bash for command execution. Cached after first resolve.
+
+    On Windows, `shutil.which("bash")` often hits `C:\\Windows\\System32\\bash.exe`
+    — the WSL launcher — which emits `/mnt/c/...` paths that `subprocess.Popen`
+    rejects as `cwd`. Git Bash candidates are checked first; PATH lookup is
+    last and filters WSL.
+    """
+    global _CACHED_BASH
+    if _CACHED_BASH is not None:
+        return _CACHED_BASH
+    _CACHED_BASH = _resolve_bash()
+    return _CACHED_BASH
+
+
+def _resolve_bash() -> str:
     if not _IS_WINDOWS:
         return (
             shutil.which("bash")
@@ -222,35 +239,21 @@ def _find_bash() -> str:
     if custom and os.path.isfile(custom):
         return custom
 
-    # Prefer Git Bash over PATH lookup. `shutil.which("bash")` on Windows
-    # frequently hits `C:\Windows\System32\bash.exe`, which is the WSL
-    # launcher — that bash emits `/mnt/c/...` paths that `subprocess.Popen`
-    # cannot use as `cwd`, and Hermes's snapshot/marker scripts assume Git
-    # Bash semantics (MSYS-style mounts). Git Bash binaries get checked
-    # first; PATH lookup is only the last resort, and WSL is filtered out.
-    #
-    # Order:
-    #   1. %LOCALAPPDATA%\hermes\git\... — Hermes portable Git from install.ps1
-    #      (PortableGit primary, MinGit legacy fallback). Lets us avoid a
-    #      broken system Git hijacking the lookup.
-    #   2. System Git for Windows install locations.
-    #   3. PATH lookup, with `system32\bash.exe` (WSL) explicitly filtered out.
-    _local_appdata = os.environ.get("LOCALAPPDATA", "")
-    _hermes_portable_git = os.path.join(_local_appdata, "hermes", "git") if _local_appdata else ""
-    if _hermes_portable_git:
-        for candidate in (
-            os.path.join(_hermes_portable_git, "bin", "bash.exe"),        # PortableGit (primary)
-            os.path.join(_hermes_portable_git, "usr", "bin", "bash.exe"), # MinGit fallback
-        ):
-            if os.path.isfile(candidate):
-                return candidate
-
-    for candidate in (
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    candidates = []
+    if local_appdata:
+        # Hermes portable Git from install.ps1 (PortableGit primary, MinGit fallback).
+        candidates += [
+            os.path.join(local_appdata, "hermes", "git", "bin", "bash.exe"),
+            os.path.join(local_appdata, "hermes", "git", "usr", "bin", "bash.exe"),
+            os.path.join(local_appdata, "Programs", "Git", "bin", "bash.exe"),
+        ]
+    candidates += [
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
-        os.path.join(_local_appdata, "Programs", "Git", "bin", "bash.exe"),
-    ):
-        if candidate and os.path.isfile(candidate):
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
             return candidate
 
     found = shutil.which("bash")

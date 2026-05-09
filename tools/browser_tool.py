@@ -1713,21 +1713,10 @@ def _find_agent_browser() -> str:
             _agent_browser_resolved = True
             return which_result
 
-    # Check local node_modules/.bin/ (npm install in repo root).
-    # On Windows, npm drops three shims in .bin: an extensionless POSIX shell
-    # script (for Git Bash / WSL), `agent-browser.cmd` (for cmd/PowerShell),
-    # and `agent-browser.ps1` (for PowerShell). CreateProcess (used by Python's
-    # subprocess on Windows) cannot execute the extensionless shim — it raises
-    # WinError 193 "%1 is not a valid Win32 application". We must resolve to the
-    # `.cmd` shim instead. `shutil.which` consults PATHEXT, so we delegate to it
-    # with an explicit path so POSIX hosts still pick the extensionless shim.
+    # Check local node_modules/.bin/ (npm install in repo root). On Windows
+    # the .cmd shim invokes /bin/sh and silently fails (WinError 3); see
+    # `_resolve_npm_shim_to_native` for the swap to the bundled native exe.
     repo_root = Path(__file__).parent.parent
-    # On Windows, npm drops three shims: a POSIX sh script (Git Bash/WSL),
-    # `agent-browser.cmd` (cmd/PowerShell), and `agent-browser.ps1`. Per
-    # `_resolve_npm_shim_to_native`'s docstring, the `.cmd` shim invokes
-    # `/bin/sh` and silently fails on native Windows with WinError 3.
-    # We resolve directly to the bundled platform-native exe instead of
-    # trusting the shim — `shutil.which` would only pick the broken `.cmd`.
     local_bin = repo_root / "node_modules" / ".bin" / "agent-browser"
     if local_bin.exists():
         _cached_agent_browser = _resolve_npm_shim_to_native(str(local_bin))
