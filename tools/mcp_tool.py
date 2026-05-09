@@ -1251,9 +1251,10 @@ class MCPServerTask:
                     for _pid in new_pids:
                         _stdio_pids.pop(_pid, None)
                     for pid in new_pids:
-                        try:
-                            os.kill(pid, 0)  # signal 0: probe liveness only
-                        except (ProcessLookupError, PermissionError, OSError):
+                        # ``os.kill(pid, 0)`` is NOT a no-op on Windows
+                        # (bpo-14484). Use the cross-platform check.
+                        from gateway.status import _pid_exists
+                        if not _pid_exists(pid):
                             continue  # process already exited — nothing to do
                         _orphan_stdio_pids.add(pid)
 
@@ -1992,7 +1993,7 @@ def _snapshot_child_pids() -> set:
     # Linux: read from /proc
     try:
         children_path = f"/proc/{my_pid}/task/{my_pid}/children"
-        with open(children_path) as f:
+        with open(children_path, encoding="utf-8") as f:
             return {int(p) for p in f.read().split() if p.strip()}
     except (FileNotFoundError, OSError, ValueError):
         pass
@@ -3331,15 +3332,17 @@ def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
     ``_orphan_stdio_pids`` are reaped so concurrent cron jobs and live user
     sessions are not disrupted.
 
-    Uses ``gateway.status.terminate_pid(force=True)`` which on Windows shells
-    out to ``taskkill /T /F`` (safe; ``os.kill(pid, 0)`` and SIGTERM on Windows
-    can themselves kill the target via CPython's ``OpenProcess`` path), and on
-    POSIX sends SIGKILL.
+    Sends SIGTERM, waits 2 seconds, then escalates to SIGKILL for any
+    survivors, avoiding shared-resource collisions when multiple hermes
+    processes run on the same host (each has its own ``_stdio_pids`` dict).
 
     With ``include_active=True`` also kills every PID in ``_stdio_pids`` —
     used only at final shutdown, after the MCP event loop has stopped and no
     sessions can still be in flight.
     """
+    import signal as _signal
+    import time as _time
+
     with _lock:
         pids: Dict[int, str] = {}
         for opid in _orphan_stdio_pids:
@@ -3349,16 +3352,36 @@ def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
             pids.update(dict(_stdio_pids))
             _stdio_pids.clear()
 
-    # Fast path: nothing to reap.
+    # Fast path: no tracked stdio PIDs to reap. Skip the SIGTERM/sleep/SIGKILL
+    # dance entirely — otherwise every MCP-free shutdown pays a 2s sleep tax.
     if not pids:
         return
 
-    from gateway.status import terminate_pid
-
+    # Phase 1: SIGTERM (graceful)
     for pid, server_name in pids.items():
         try:
-            terminate_pid(pid, force=True)
-            logger.debug("Force-killed orphaned MCP stdio process %d (%s)", pid, server_name)
+            os.kill(pid, _signal.SIGTERM)
+            logger.debug("Sent SIGTERM to orphaned MCP process %d (%s)", pid, server_name)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    # Phase 2: Wait for graceful exit
+    _time.sleep(2)
+
+    # Phase 3: SIGKILL any survivors
+    _sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
+    # ``os.kill(pid, 0)`` is NOT a no-op on Windows. Use the cross-platform
+    # existence check before escalating to SIGKILL.
+    from gateway.status import _pid_exists
+    for pid, server_name in pids.items():
+        if not _pid_exists(pid):
+            continue  # Good — exited after SIGTERM
+        try:
+            os.kill(pid, _sigkill)
+            logger.warning(
+                "Force-killed MCP process %d (%s) after SIGTERM timeout",
+                pid, server_name,
+            )
         except (ProcessLookupError, PermissionError, OSError):
             pass
 

@@ -46,7 +46,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
-from gateway.status import is_process_alive
 
 logger = logging.getLogger(__name__)
 
@@ -403,7 +402,12 @@ class ProcessRegistry:
     @staticmethod
     def _is_host_pid_alive(pid: Optional[int]) -> bool:
         """Best-effort liveness check for host-visible PIDs."""
-        return bool(pid) and is_process_alive(pid)
+        if not pid:
+            return False
+        # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484) — use
+        # the cross-platform existence check.
+        from gateway.status import _pid_exists
+        return _pid_exists(pid)
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Update recovered host-PID sessions when the underlying process has exited."""
@@ -431,10 +435,22 @@ class ProcessRegistry:
             os.kill(pid, signal.SIGTERM)
             return
 
+        import psutil
         try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except (OSError, ProcessLookupError, PermissionError):
-            os.kill(pid, signal.SIGTERM)
+            parent = psutil.Process(pid)
+            for child in parent.children(recursive=True):
+                try:
+                    child.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            parent.terminate()
+        except psutil.NoSuchProcess:
+            return
+        except (OSError, PermissionError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError, PermissionError):
+                pass
 
     # ----- Spawn -----
 
@@ -1028,12 +1044,22 @@ class ProcessRegistry:
                     if session.pid:
                         os.kill(session.pid, signal.SIGTERM)
             elif session.process:
-                # Local process -- kill the process group
+                # Local process -- kill the process tree
                 try:
                     if _IS_WINDOWS:
                         session.process.terminate()
                     else:
-                        os.killpg(os.getpgid(session.process.pid), signal.SIGTERM)
+                        import psutil
+                        try:
+                            parent = psutil.Process(session.process.pid)
+                            for child in parent.children(recursive=True):
+                                try:
+                                    child.terminate()
+                                except psutil.NoSuchProcess:
+                                    pass
+                            parent.terminate()
+                        except psutil.NoSuchProcess:
+                            pass
                 except (ProcessLookupError, PermissionError):
                     session.process.kill()
             elif session.env_ref and session.pid:
