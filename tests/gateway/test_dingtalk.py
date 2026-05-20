@@ -299,17 +299,29 @@ class TestSend:
         assert "400" in result.error
 
     @pytest.mark.asyncio
-    async def test_send_image_renders_markdown_image(self):
+    async def test_send_image_uses_openapi_sample_image_msg(self):
+        """Remote URLs go through Robot OpenAPI sampleImageMsg.
+
+        Caption is sent first as a separate markdown message, then the
+        image is delivered via OpenAPI photoURL.
+        """
         from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.platforms.base import SendResult
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
 
+        # Caption goes through the webhook path; mock the webhook response.
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.text = "OK"
-
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(return_value=mock_response)
         adapter._http_client = mock_client
+
+        # OpenAPI call: stub at the public entry point so SDK init is
+        # irrelevant to the test.
+        adapter._send_robot_openapi = AsyncMock(
+            return_value=SendResult(success=True, message_id="openapi-1"),
+        )
 
         result = await adapter.send_image(
             "chat-123",
@@ -319,29 +331,158 @@ class TestSend:
         )
 
         assert result.success is True
-        payload = mock_client.post.call_args.kwargs["json"]
-        assert payload["msgtype"] == "markdown"
-        assert payload["markdown"]["text"] == "Screenshot\n\n![image](https://example.com/demo.png)"
+        assert result.message_id == "openapi-1"
+
+        # Caption was sent via webhook first.
+        caption_payload = mock_client.post.call_args_list[0].kwargs["json"]
+        assert caption_payload["msgtype"] == "markdown"
+        assert caption_payload["markdown"]["text"] == "Screenshot"
+
+        # Image went via OpenAPI sampleImageMsg with photoURL=remote URL.
+        adapter._send_robot_openapi.assert_awaited_once()
+        call_kwargs = adapter._send_robot_openapi.call_args.kwargs
+        assert call_kwargs["msg_key"] == "sampleImageMsg"
+        assert call_kwargs["msg_param"] == {"photoURL": "https://example.com/demo.png"}
 
     @pytest.mark.asyncio
-    async def test_send_image_file_returns_explicit_unsupported_error(self):
+    async def test_send_image_file_uploads_then_sends_via_openapi(self):
+        """Local image: upload to /media/upload, then sampleImageMsg w/ media_id."""
         from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.platforms.base import SendResult
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+
+        adapter._upload_media = AsyncMock(return_value="@media_abc123")
+        adapter._send_robot_openapi = AsyncMock(
+            return_value=SendResult(success=True, message_id="img-1"),
+        )
 
         result = await adapter.send_image_file("chat-123", "/tmp/demo.png")
 
-        assert result.success is False
-        assert result.error and "do not support local image uploads" in result.error
+        assert result.success is True
+        adapter._upload_media.assert_awaited_once_with("/tmp/demo.png", "image")
+        call_kwargs = adapter._send_robot_openapi.call_args.kwargs
+        assert call_kwargs["msg_key"] == "sampleImageMsg"
+        assert call_kwargs["msg_param"] == {"photoURL": "@media_abc123"}
 
     @pytest.mark.asyncio
-    async def test_send_document_returns_explicit_unsupported_error(self):
+    async def test_send_image_file_falls_back_to_webhook_on_upload_failure(self):
+        """Upload failure surfaces a webhook hint instead of hard-failing."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
 
-        result = await adapter.send_document("chat-123", "/tmp/demo.pdf")
+        adapter._upload_media = AsyncMock(return_value=None)
 
-        assert result.success is False
-        assert result.error and "do not support local file attachments" in result.error
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = "OK"
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        adapter._http_client = mock_client
+
+        result = await adapter.send_image_file(
+            "chat-123",
+            "/tmp/demo.png",
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+        # Webhook fallback succeeded — even though we couldn't deliver the
+        # image, the user gets a hint message.
+        assert result.success is True
+        payload = mock_client.post.call_args.kwargs["json"]
+        assert "demo.png" in payload["markdown"]["text"]
+        assert "上传失败" in payload["markdown"]["text"]
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_fallback_distinguishes_upload_vs_send_failure(self):
+        """Upload OK but OpenAPI send fails → fallback says 发送失败, not 上传失败."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.platforms.base import SendResult
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+
+        adapter._upload_media = AsyncMock(return_value="@media_xyz")
+        adapter._send_robot_openapi = AsyncMock(
+            return_value=SendResult(
+                success=False, error="No inbound message context",
+            ),
+        )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = "OK"
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        adapter._http_client = mock_client
+
+        result = await adapter.send_image_file(
+            "chat-123",
+            "/tmp/demo.png",
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+        assert result.success is True
+        payload = mock_client.post.call_args.kwargs["json"]
+        assert "demo.png" in payload["markdown"]["text"]
+        assert "发送失败" in payload["markdown"]["text"]
+        assert "上传失败" not in payload["markdown"]["text"]
+
+    @pytest.mark.asyncio
+    async def test_send_video_uses_mp4_default_when_path_has_no_suffix(self):
+        """Suffix-less video paths get fileType='mp4', not 'bin'."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.platforms.base import SendResult
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+
+        adapter._upload_media = AsyncMock(return_value="@media_vid")
+        adapter._send_robot_openapi = AsyncMock(
+            return_value=SendResult(success=True, message_id="vid-1"),
+        )
+
+        # No extension on the path — should pick the type-appropriate default.
+        result = await adapter.send_video("chat-123", "/tmp/clip_no_ext")
+        assert result.success is True
+        param = adapter._send_robot_openapi.call_args.kwargs["msg_param"]
+        assert param["fileType"] == "mp4"
+
+    @pytest.mark.asyncio
+    async def test_send_voice_uses_mp3_default_when_path_has_no_suffix(self):
+        """Suffix-less voice paths get fileType='mp3', not 'bin'."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.platforms.base import SendResult
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+
+        adapter._upload_media = AsyncMock(return_value="@media_voice")
+        adapter._send_robot_openapi = AsyncMock(
+            return_value=SendResult(success=True, message_id="voice-1"),
+        )
+
+        result = await adapter.send_voice("chat-123", "/tmp/note_no_ext")
+        assert result.success is True
+        param = adapter._send_robot_openapi.call_args.kwargs["msg_param"]
+        assert param["fileType"] == "mp3"
+
+    @pytest.mark.asyncio
+    async def test_send_document_uploads_then_sends_via_openapi(self):
+        """Local file: upload, then sampleFile with mediaId + fileName + fileType."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.platforms.base import SendResult
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+
+        adapter._upload_media = AsyncMock(return_value="@media_file_xyz")
+        adapter._send_robot_openapi = AsyncMock(
+            return_value=SendResult(success=True, message_id="doc-1"),
+        )
+
+        result = await adapter.send_document("chat-123", "/tmp/report.pdf")
+
+        assert result.success is True
+        adapter._upload_media.assert_awaited_once_with("/tmp/report.pdf", "file")
+        call_kwargs = adapter._send_robot_openapi.call_args.kwargs
+        assert call_kwargs["msg_key"] == "sampleFile"
+        assert call_kwargs["msg_param"] == {
+            "mediaId": "@media_file_xyz",
+            "fileName": "report.pdf",
+            "fileType": "pdf",
+        }
 
 
 # ---------------------------------------------------------------------------

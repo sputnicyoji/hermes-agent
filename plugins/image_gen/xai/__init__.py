@@ -186,6 +186,14 @@ class XAIImageGenProvider(ImageGenProvider):
             "prompt": prompt,
             "aspect_ratio": xai_ar,
             "resolution": xai_res,
+            # xAI default is response_format=url, which returns a
+            # short-lived signed CDN URL (imgen.x.ai/.../xai-tmp-imgen-*.jpeg)
+            # that needs the OAuth bearer to GET. Platforms like Dingtalk
+            # download the URL without the bearer and end up with an HTML
+            # error page rendered as a "broken image". Request b64_json so
+            # the plugin saves the bytes locally and hands the platform a
+            # filesystem path instead.
+            "response_format": "b64_json",
         }
 
         headers = {

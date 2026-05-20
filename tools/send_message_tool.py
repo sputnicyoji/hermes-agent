@@ -32,6 +32,7 @@ _SLACK_TARGET_RE = re.compile(r"^\s*([CGDU][A-Z0-9]{8,})\s*$")
 _SLACK_THREAD_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,}):([^\s:]+)\s*$")
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
+_DINGTALK_CHAT_ID_RE = re.compile(r"^\s*(cid[-A-Za-z0-9+/=]+)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
 # Platforms that address recipients by phone number and accept E.164 format
@@ -170,7 +171,21 @@ def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
+    inferred_current_target = False
+    if not target and message:
+        target = _infer_current_session_target()
+        inferred_current_target = bool(target)
     if not target or not message:
+        logger.warning(
+            "send_message missing required args: keys=%s target_present=%s "
+            "message_present=%s target_len=%d message_len=%d action=%r",
+            sorted(args.keys()) if isinstance(args, dict) else type(args).__name__,
+            bool(target),
+            bool(message),
+            len(str(target or "")),
+            len(str(message or "")),
+            args.get("action") if isinstance(args, dict) else None,
+        )
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
     parts = target.split(":", 1)
@@ -312,6 +327,8 @@ def _handle_send(args):
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
+        elif inferred_current_target and isinstance(result, dict) and result.get("success"):
+            result["note"] = f"Sent to current {platform_name} conversation (chat_id: {chat_id})"
 
         # Mirror the sent message into the target's gateway session
         if isinstance(result, dict) and result.get("success") and mirror_text:
@@ -337,6 +354,24 @@ def _handle_send(args):
         return json.dumps(result)
     except Exception as e:
         return json.dumps(_error(f"Send failed: {e}"))
+
+
+def _infer_current_session_target() -> str:
+    """Infer a send target from the current gateway session context."""
+    try:
+        from gateway.session_context import get_session_env
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+    except Exception:
+        return ""
+
+    if not platform or platform == "local" or not chat_id:
+        return ""
+    target = f"{platform}:{chat_id}"
+    if thread_id:
+        target = f"{target}:{thread_id}"
+    return target
 
 
 def _parse_target_ref(platform_name: str, target_ref: str):
@@ -376,6 +411,10 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if target_ref.strip().isdigit():
             return f"group:{target_ref.strip()}", None, True
         return None, None, False
+    if platform_name == "dingtalk":
+        match = _DINGTALK_CHAT_ID_RE.fullmatch(target_ref)
+        if match:
+            return match.group(1), None, True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -458,6 +497,146 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
+def _get_live_gateway_adapter(platform):
+    """Return the in-process gateway adapter for ``platform``, if available."""
+    runner = None
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+    except Exception:
+        runner = None
+
+    if runner is None:
+        return None
+
+    try:
+        return runner.adapters.get(platform)
+    except Exception:
+        return None
+
+
+async def _send_dingtalk_via_adapter(
+    platform,
+    pconfig,
+    chat_id,
+    chunk,
+    *,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    allow_text_failure=False,
+):
+    """Send DingTalk through the live gateway adapter.
+
+    The static webhook path is text-only and can be blocked by robot keyword
+    filters. Media delivery must use the live DingTalkAdapter so it can call
+    the OpenAPI upload / sample message pipeline with the cached inbound
+    conversation context.
+    """
+    media_files = media_files or []
+    adapter = _get_live_gateway_adapter(platform)
+
+    if adapter is None:
+        if media_files:
+            return {
+                "error": (
+                    "DingTalk MEDIA delivery via send_message requires a live "
+                    "gateway adapter in this process. Static DINGTALK_WEBHOOK_URL "
+                    "delivery is text-only and would omit attachments."
+                )
+            }
+        return await _send_dingtalk(pconfig.extra, chat_id, chunk)
+
+    metadata = {"thread_id": thread_id} if thread_id else None
+    last_message_id = None
+    warnings = []
+
+    if chunk and chunk.strip():
+        try:
+            text_result = await adapter.send(
+                chat_id=chat_id,
+                content=chunk,
+                metadata=metadata,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if not allow_text_failure:
+                return _error(f"DingTalk live adapter text send failed: {e}")
+            warnings.append(f"DingTalk caption send failed; media send continued: {e}")
+            text_result = None
+
+        if text_result and not getattr(text_result, "success", True):
+            error = getattr(text_result, "error", "unknown")
+            if not allow_text_failure:
+                return _error(f"DingTalk live adapter text send failed: {error}")
+            warnings.append(f"DingTalk caption send failed; media send continued: {error}")
+        elif text_result:
+            last_message_id = getattr(text_result, "message_id", None)
+
+    if media_files:
+        from pathlib import Path
+        from gateway.platforms.base import should_send_media_as_audio
+
+        for media_path, is_voice in media_files:
+            ext = Path(media_path).suffix.lower()
+            try:
+                if force_document:
+                    media_result = await adapter.send_document(
+                        chat_id=chat_id,
+                        file_path=media_path,
+                        metadata=metadata,
+                    )
+                elif should_send_media_as_audio(platform, ext, is_voice=is_voice):
+                    media_result = await adapter.send_voice(
+                        chat_id=chat_id,
+                        audio_path=media_path,
+                        metadata=metadata,
+                    )
+                elif ext in _VIDEO_EXTS:
+                    media_result = await adapter.send_video(
+                        chat_id=chat_id,
+                        video_path=media_path,
+                        metadata=metadata,
+                    )
+                elif ext in _IMAGE_EXTS:
+                    media_result = await adapter.send_image_file(
+                        chat_id=chat_id,
+                        image_path=media_path,
+                        metadata=metadata,
+                    )
+                else:
+                    media_result = await adapter.send_document(
+                        chat_id=chat_id,
+                        file_path=media_path,
+                        metadata=metadata,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                return _error(f"DingTalk live adapter media send failed for {media_path}: {e}")
+
+            if media_result and not getattr(media_result, "success", True):
+                return _error(
+                    f"DingTalk live adapter media send failed for {media_path}: "
+                    f"{getattr(media_result, 'error', 'unknown')}"
+                )
+            last_message_id = getattr(media_result, "message_id", None) or last_message_id
+
+    if not (chunk and chunk.strip()) and not media_files:
+        return _error("No DingTalk text or media to send")
+
+    result = {
+        "success": True,
+        "platform": "dingtalk",
+        "chat_id": chat_id,
+        "message_id": last_message_id,
+    }
+    if warnings:
+        result["warnings"] = [_sanitize_error_text(warning) for warning in warnings]
+    return result
+
+
 async def _send_via_adapter(
     platform,
     pconfig,
@@ -479,29 +658,18 @@ async def _send_via_adapter(
          the runner weakref is ``None``).
       3. A descriptive error explaining both options.
     """
-    runner = None
-    try:
-        from gateway.run import _gateway_runner_ref
-        runner = _gateway_runner_ref()
-    except Exception:
-        runner = None
-
-    if runner is not None:
+    adapter = _get_live_gateway_adapter(platform)
+    if adapter is not None:
         try:
-            adapter = runner.adapters.get(platform)
-        except Exception:
-            adapter = None
-        if adapter is not None:
-            try:
-                metadata = {"thread_id": thread_id} if thread_id else None
-                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                return {"error": f"Plugin platform send failed: {e}"}
-            if result.success:
-                return {"success": True, "message_id": result.message_id}
-            return {"error": f"Adapter send failed: {result.error}"}
+            metadata = {"thread_id": thread_id} if thread_id else None
+            result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return {"error": f"Plugin platform send failed: {e}"}
+        if result.success:
+            return {"success": True, "message_id": result.message_id}
+        return {"error": f"Adapter send failed: {result.error}"}
 
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     entry = None
@@ -717,11 +885,37 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- DingTalk: use the live gateway adapter for session/OpenAPI sends ---
+    if platform == Platform.DINGTALK:
+        last_result = None
+        warnings = []
+        has_media = bool(media_files)
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_dingtalk_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if is_last else [],
+                force_document=force_document,
+                allow_text_failure=has_media,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            if isinstance(result, dict) and result.get("warnings"):
+                warnings.extend(result["warnings"])
+            last_result = result
+        if warnings and isinstance(last_result, dict):
+            last_result["warnings"] = warnings
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and dingtalk; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -729,7 +923,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and dingtalk"
         )
 
     last_result = None
@@ -750,8 +944,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_matrix(pconfig.token, pconfig.extra, chat_id, chunk)
         elif platform == Platform.HOMEASSISTANT:
             result = await _send_homeassistant(pconfig.token, pconfig.extra, chat_id, chunk)
-        elif platform == Platform.DINGTALK:
-            result = await _send_dingtalk(pconfig.extra, chat_id, chunk)
         elif platform == Platform.FEISHU:
             result = await _send_feishu(pconfig, chat_id, chunk, thread_id=thread_id)
         elif platform == Platform.WECOM:

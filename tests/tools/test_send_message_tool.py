@@ -82,6 +82,45 @@ def _ensure_slack_mock(monkeypatch):
 
 
 class TestSendMessageTool:
+    def test_missing_target_infers_current_gateway_session(self):
+        dingtalk_cfg = SimpleNamespace(enabled=True, token=None, extra={})
+        config = SimpleNamespace(
+            platforms={Platform.DINGTALK: dingtalk_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_SESSION_PLATFORM": "dingtalk",
+                "HERMES_SESSION_CHAT_ID": "cid-current",
+            },
+            clear=False,
+        ), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "message": "MEDIA:C:\\Users\\zhangxuechen\\.hermes\\cache\\images\\22222.jpg",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result["note"] == "Sent to current dingtalk conversation (chat_id: cid-current)"
+        send_mock.assert_awaited_once()
+        call = send_mock.await_args
+        assert call.args[0] == Platform.DINGTALK
+        assert call.args[2] == "cid-current"
+        assert call.args[3] == ""
+        assert call.kwargs["media_files"] == [
+            (r"C:\Users\zhangxuechen\.hermes\cache\images\22222.jpg", False)
+        ]
+
     def test_cron_duplicate_target_is_skipped_and_explained(self):
         home = SimpleNamespace(chat_id="-1001")
         config, _telegram_cfg = _make_config()
@@ -678,6 +717,136 @@ class TestSendToPlatformChunking:
             ("disconnect",),
         ]
 
+    def test_dingtalk_media_uses_live_adapter_not_static_webhook(self, tmp_path):
+        image_path = tmp_path / "demo.png"
+        image_path.write_bytes(b"png")
+
+        adapter = SimpleNamespace(
+            send=AsyncMock(return_value=SimpleNamespace(success=True, message_id="txt-1")),
+            send_image_file=AsyncMock(return_value=SimpleNamespace(success=True, message_id="img-1")),
+            send_document=AsyncMock(return_value=SimpleNamespace(success=True, message_id="doc-1")),
+            send_video=AsyncMock(return_value=SimpleNamespace(success=True, message_id="vid-1")),
+            send_voice=AsyncMock(return_value=SimpleNamespace(success=True, message_id="voice-1")),
+        )
+        runner = SimpleNamespace(adapters={Platform.DINGTALK: adapter})
+        fake_gateway_run = SimpleNamespace(_gateway_runner_ref=lambda: runner)
+        webhook_send = AsyncMock(return_value={"success": True, "platform": "dingtalk"})
+
+        with patch.dict(sys.modules, {"gateway.run": fake_gateway_run}), \
+             patch("tools.send_message_tool._send_dingtalk", webhook_send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DINGTALK,
+                    SimpleNamespace(enabled=True, token=None, extra={}),
+                    "chat-123",
+                    "caption",
+                    media_files=[(str(image_path), False)],
+                )
+            )
+
+        assert result == {
+            "success": True,
+            "platform": "dingtalk",
+            "chat_id": "chat-123",
+            "message_id": "img-1",
+        }
+        adapter.send.assert_awaited_once_with(
+            chat_id="chat-123",
+            content="caption",
+            metadata=None,
+        )
+        adapter.send_image_file.assert_awaited_once_with(
+            chat_id="chat-123",
+            image_path=str(image_path),
+            metadata=None,
+        )
+        adapter.send_document.assert_not_awaited()
+        webhook_send.assert_not_awaited()
+
+    def test_dingtalk_media_continues_when_caption_send_fails(self, tmp_path):
+        image_path = tmp_path / "demo.png"
+        image_path.write_bytes(b"png")
+
+        adapter = SimpleNamespace(
+            send=AsyncMock(
+                return_value=SimpleNamespace(
+                    success=False,
+                    error="No valid session_webhook available",
+                )
+            ),
+            send_image_file=AsyncMock(return_value=SimpleNamespace(success=True, message_id="img-1")),
+            send_document=AsyncMock(return_value=SimpleNamespace(success=True, message_id="doc-1")),
+            send_video=AsyncMock(return_value=SimpleNamespace(success=True, message_id="vid-1")),
+            send_voice=AsyncMock(return_value=SimpleNamespace(success=True, message_id="voice-1")),
+        )
+        runner = SimpleNamespace(adapters={Platform.DINGTALK: adapter})
+        fake_gateway_run = SimpleNamespace(_gateway_runner_ref=lambda: runner)
+
+        with patch.dict(sys.modules, {"gateway.run": fake_gateway_run}):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DINGTALK,
+                    SimpleNamespace(enabled=True, token=None, extra={}),
+                    "chat-123",
+                    "caption",
+                    media_files=[(str(image_path), False)],
+                )
+            )
+
+        assert result["success"] is True
+        assert result["message_id"] == "img-1"
+        assert "warnings" in result
+        assert "caption send failed" in result["warnings"][0]
+        adapter.send.assert_awaited_once()
+        adapter.send_image_file.assert_awaited_once_with(
+            chat_id="chat-123",
+            image_path=str(image_path),
+            metadata=None,
+        )
+
+    def test_dingtalk_media_without_live_adapter_does_not_fall_back_to_webhook(self, tmp_path):
+        image_path = tmp_path / "demo.png"
+        image_path.write_bytes(b"png")
+
+        fake_gateway_run = SimpleNamespace(_gateway_runner_ref=lambda: None)
+        webhook_send = AsyncMock(return_value={"success": True, "platform": "dingtalk"})
+
+        with patch.dict(sys.modules, {"gateway.run": fake_gateway_run}), \
+             patch("tools.send_message_tool._send_dingtalk", webhook_send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DINGTALK,
+                    SimpleNamespace(enabled=True, token=None, extra={}),
+                    "chat-123",
+                    "",
+                    media_files=[(str(image_path), False)],
+                )
+            )
+
+        assert "error" in result
+        assert "requires a live gateway adapter" in result["error"]
+        webhook_send.assert_not_awaited()
+
+    def test_dingtalk_text_without_live_adapter_keeps_static_webhook_fallback(self):
+        fake_gateway_run = SimpleNamespace(_gateway_runner_ref=lambda: None)
+        webhook_send = AsyncMock(
+            return_value={"success": True, "platform": "dingtalk", "chat_id": "chat-123"}
+        )
+
+        with patch.dict(sys.modules, {"gateway.run": fake_gateway_run}), \
+             patch("tools.send_message_tool._send_dingtalk", webhook_send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DINGTALK,
+                    SimpleNamespace(enabled=True, token=None, extra={}),
+                    "chat-123",
+                    "hello",
+                )
+            )
+
+        assert result["success"] is True
+        webhook_send.assert_awaited_once_with({}, "chat-123", "hello")
+
 
 # ---------------------------------------------------------------------------
 # HTML auto-detection in Telegram send
@@ -1099,6 +1268,27 @@ class TestParseTargetRefSlack:
     def test_slack_id_not_explicit_for_other_platforms(self):
         assert _parse_target_ref("discord", "C0B0QV5434G")[2] is False
         assert _parse_target_ref("telegram", "C0B0QV5434G")[2] is False
+
+
+class TestParseTargetRefDingTalk:
+    """_parse_target_ref recognizes DingTalk conversation IDs as explicit."""
+
+    def test_dingtalk_cid_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref(
+            "dingtalk",
+            "cidcVcut2w73fXGatZSwimKaEDpXrhVkCvE0pjjsiYgz3U=",
+        )
+        assert chat_id == "cidcVcut2w73fXGatZSwimKaEDpXrhVkCvE0pjjsiYgz3U="
+        assert thread_id is None
+        assert is_explicit is True
+
+    def test_dingtalk_cid_with_whitespace_is_stripped(self):
+        chat_id, _, is_explicit = _parse_target_ref("dingtalk", "  cid-current  ")
+        assert chat_id == "cid-current"
+        assert is_explicit is True
+
+    def test_dingtalk_cid_only_matches_dingtalk(self):
+        assert _parse_target_ref("telegram", "cid-current")[2] is False
 
 
 class TestSendDiscordThreadId:
