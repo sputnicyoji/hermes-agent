@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.video_gen_provider import (
     COMMON_ASPECT_RATIOS,
@@ -307,6 +307,91 @@ def _normalize_reference_images(value: Any) -> Optional[List[str]]:
     return out or None
 
 
+def _resolve_provider_caps() -> Tuple[Optional[Any], Dict[str, Any]]:
+    """Return ``(active_provider, capabilities_dict)`` or ``(None, {})``.
+
+    Shared between ``check_*_requirements``, ``_handle_video_*`` dispatch,
+    and the dynamic schema builders so the provider lookup + defensive
+    ``capabilities()`` try/except lives in one place.
+    """
+    provider = _resolve_active_provider()
+    if provider is None:
+        return None, {}
+    try:
+        caps = provider.capabilities() or {}
+    except Exception:
+        caps = {}
+    return provider, caps
+
+
+def _dispatch_video_provider(
+    provider: Any,
+    method_name: str,
+    prompt: str,
+    model: str,
+    kwargs: Dict[str, Any],
+) -> str:
+    """Invoke ``provider.<method_name>(prompt=..., **kwargs)`` with uniform
+    error handling. Returns the JSON-serialised provider result, or a
+    JSON-serialised :func:`error_response` if dispatch surfaced a problem.
+
+    Centralises the TypeError-vs-Exception-vs-not-dict trifecta so
+    ``video_generate`` and ``video_extend`` cannot drift apart on
+    error-shape contracts.
+    """
+    method = getattr(provider, method_name, None)
+    if not callable(method):
+        return json.dumps(error_response(
+            error=(
+                f"Provider '{getattr(provider, 'name', '?')}' has no "
+                f"{method_name}() — implementation contract violation."
+            ),
+            error_type="provider_contract",
+            provider=getattr(provider, "name", ""),
+            model=model or "",
+            prompt=prompt,
+        ))
+    try:
+        result = method(prompt=prompt, **kwargs)
+    except TypeError as exc:
+        logger.warning(
+            "video_gen provider '%s' rejected %s kwargs: %s",
+            getattr(provider, "name", "?"), method_name, exc,
+        )
+        return json.dumps(error_response(
+            error=(
+                f"Provider '{getattr(provider, 'name', '?')}' {method_name} "
+                f"signature is out of date with the tool schema. Report "
+                f"this to the plugin author."
+            ),
+            error_type="provider_contract",
+            provider=getattr(provider, "name", ""),
+            model=model or "",
+            prompt=prompt,
+        ))
+    except Exception as exc:
+        logger.warning(
+            "video_gen provider '%s' raised on %s: %s",
+            getattr(provider, "name", "?"), method_name, exc,
+        )
+        return json.dumps(error_response(
+            error=f"Provider '{getattr(provider, 'name', '?')}' error: {exc}",
+            error_type="provider_exception",
+            provider=getattr(provider, "name", ""),
+            model=model or "",
+            prompt=prompt,
+        ))
+    if not isinstance(result, dict):
+        return json.dumps(error_response(
+            error="Provider returned a non-dict result",
+            error_type="provider_contract",
+            provider=getattr(provider, "name", ""),
+            model=model or "",
+            prompt=prompt,
+        ))
+    return json.dumps(result)
+
+
 def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
     prompt = (args.get("prompt") or "").strip()
     image_url = (args.get("image_url") or "").strip() or None
@@ -327,7 +412,7 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
 
     # Resolve the active provider.
     configured = _read_configured_video_provider()
-    provider = _resolve_active_provider()
+    provider, _caps = _resolve_provider_caps()
     if provider is None:
         return _missing_provider_error(configured)
 
@@ -348,49 +433,7 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
     # Drop None entries so providers see clean defaults.
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-    try:
-        result = provider.generate(prompt=prompt, **kwargs)
-    except TypeError as exc:
-        # A provider that hasn't widened its signature is a bug, not a
-        # caller error — log and surface a clear contract message.
-        logger.warning(
-            "video_gen provider '%s' rejected kwargs (signature too narrow): %s",
-            getattr(provider, "name", "?"), exc,
-        )
-        return json.dumps(error_response(
-            error=(
-                f"Provider '{getattr(provider, 'name', '?')}' signature is "
-                f"out of date with the video_generate schema. Report this "
-                f"to the plugin author."
-            ),
-            error_type="provider_contract",
-            provider=getattr(provider, "name", ""),
-            model=model or "",
-            prompt=prompt,
-        ))
-    except Exception as exc:
-        logger.warning(
-            "video_gen provider '%s' raised: %s",
-            getattr(provider, "name", "?"), exc,
-        )
-        return json.dumps(error_response(
-            error=f"Provider '{getattr(provider, 'name', '?')}' error: {exc}",
-            error_type="provider_exception",
-            provider=getattr(provider, "name", ""),
-            model=model or "",
-            prompt=prompt,
-        ))
-
-    if not isinstance(result, dict):
-        return json.dumps(error_response(
-            error="Provider returned a non-dict result",
-            error_type="provider_contract",
-            provider=getattr(provider, "name", ""),
-            model=model or "",
-            prompt=prompt,
-        ))
-
-    return json.dumps(result)
+    return _dispatch_video_provider(provider, "generate", prompt, model or "", kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -558,4 +601,152 @@ registry.register(
     is_async=False,
     emoji="🎬",
     dynamic_schema_overrides=_build_dynamic_video_schema,
+)
+
+
+# ---------------------------------------------------------------------------
+# video_extend — continuation of an existing video. Opt-in capability: only
+# registered for providers whose ``capabilities()`` reports
+# ``supports_extend=True``. xAI Grok-Imagine is the first such backend.
+# ---------------------------------------------------------------------------
+
+
+VIDEO_EXTEND_SCHEMA: Dict[str, Any] = {
+    "name": "video_extend",
+    # Real description is built dynamically — see _build_dynamic_video_extend_schema.
+    "description": "(rebuilt at get_definitions() time — see _build_dynamic_video_extend_schema)",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": (
+                    "Text instruction describing how the continuation should "
+                    "evolve from the source video's last frame (camera move, "
+                    "subject behaviour, ambient changes). Keep it concrete — "
+                    "vague extension prompts are more likely to trip content "
+                    "moderation than the original generate path."
+                ),
+            },
+            "video_url": {
+                "type": "string",
+                "description": (
+                    "Source video to extend. Accepts a public HTTPS URL, a "
+                    "base64 ``data:video/mp4;...`` URI, or a local file path "
+                    "(e.g. the ``video`` field returned by a prior "
+                    "video_generate call). Local paths are auto-converted to "
+                    "data URLs by the plugin before submission."
+                ),
+            },
+            "duration": {
+                "type": "integer",
+                "description": (
+                    "How many seconds to append. Providers clamp; xAI accepts "
+                    "6 or 10. The returned video is the FULL concatenation "
+                    "(source + new footage), not just the appended segment."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model override. If omitted, the user's configured "
+                    "``video_gen.model`` is used."
+                ),
+            },
+        },
+        "required": ["prompt", "video_url"],
+    },
+}
+
+
+def _handle_video_extend(args: Dict[str, Any], **_kw: Any) -> str:
+    prompt = (args.get("prompt") or "").strip()
+    video_url = (args.get("video_url") or "").strip()
+    duration = _coerce_int(args.get("duration"))
+    model_override = (args.get("model") or "").strip() or None
+
+    if not prompt:
+        return tool_error("prompt is required for video extension")
+    if not video_url:
+        return tool_error("video_url (source video) is required for video extension")
+
+    configured = _read_configured_video_provider()
+    provider, caps = _resolve_provider_caps()
+    if provider is None:
+        return _missing_provider_error(configured)
+
+    if not caps.get("supports_extend"):
+        # Defensive: check_video_extend_requirements should have hidden the
+        # tool from agents on backends without extend, but a stale schema
+        # cache or a direct API caller could still reach this dispatch.
+        return json.dumps(error_response(
+            error=(
+                f"Provider '{getattr(provider, 'name', '?')}' does not support "
+                f"video extension. Switch to a backend whose capabilities "
+                f"report supports_extend=True (xAI today)."
+            ),
+            error_type="not_supported",
+            provider=getattr(provider, "name", ""),
+            model=model_override or "",
+            prompt=prompt,
+        ))
+
+    model = model_override or _read_configured_video_model() or provider.default_model()
+    kwargs = {"video_url": video_url, "model": model, "duration": duration}
+    return _dispatch_video_provider(provider, "extend", prompt, model or "", kwargs)
+
+
+def check_video_extend_requirements() -> bool:
+    """Mirror of check_video_generation_requirements + supports_extend gate."""
+    if not check_video_generation_requirements():
+        return False
+    _provider, caps = _resolve_provider_caps()
+    return bool(caps.get("supports_extend"))
+
+
+def _build_dynamic_video_extend_schema() -> Dict[str, Any]:
+    """Describe what video_extend does on the active backend, or hide it.
+
+    When the active provider doesn't ``supports_extend``, return a stub
+    description that nudges the model toward video_generate instead — the
+    capability check_fn already filters it out of the toolset for those
+    backends, so this is just defensive.
+    """
+    configured = _read_configured_video_provider()
+    provider, caps = _resolve_provider_caps() if configured else (None, {})
+
+    if not caps.get("supports_extend"):
+        return {"description": (
+            "Video extension is not available on the active backend. Use "
+            "video_generate for new clips. Switch to xAI (`hermes tools` → "
+            "Video Generation → xai) to enable video_extend."
+        )}
+
+    max_ext = caps.get("max_extend_duration") or 10
+    parts = [
+        "Extend an existing video by appending new footage that continues "
+        "from its last frame. Returns a single MP4 containing the FULL "
+        f"concatenated result (source + up to {max_ext}s of new content), "
+        "not just the appended segment.",
+        "",
+        f"- Active backend: {provider.display_name} ({configured})",
+        f"- Continuation length: typically 6 or 10 seconds",
+        "- Source format: HTTPS URL, base64 data: URI, or a local file path",
+        "- Moderation: the extension path tends to be stricter than the "
+        "generate path; if a previous extend was rejected, prefer concrete "
+        "passive prompts (e.g. 'still scene, gentle wind') over action verbs.",
+    ]
+    return {"description": "\n".join(parts)}
+
+
+registry.register(
+    name="video_extend",
+    toolset="video_gen",
+    schema=VIDEO_EXTEND_SCHEMA,
+    handler=_handle_video_extend,
+    check_fn=check_video_extend_requirements,
+    requires_env=[],
+    is_async=False,
+    emoji="🎞️",
+    dynamic_schema_overrides=_build_dynamic_video_extend_schema,
 )

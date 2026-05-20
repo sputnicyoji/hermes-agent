@@ -21,7 +21,9 @@ delivers it.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import mimetypes
 import os
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,6 +33,7 @@ import httpx
 from agent.video_gen_provider import (
     VideoGenProvider,
     error_response,
+    save_bytes_video,
     success_response,
 )
 
@@ -52,6 +55,13 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5
 VALID_ASPECT_RATIOS = {"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"}
 VALID_RESOLUTIONS = {"480p", "720p"}
 MAX_REFERENCE_IMAGES = 7
+# xAI's /v1/videos/extensions accepts 6 or 10 seconds per the docs; clamp to
+# this range so the agent doesn't burn a request on an obviously-invalid
+# duration. The plugin still echoes the user's value back when it falls in
+# the valid set.
+VALID_EXTEND_DURATIONS = (6, 10)
+DEFAULT_EXTEND_DURATION = 6
+MAX_EXTEND_DURATION = max(VALID_EXTEND_DURATIONS)
 
 
 _MODELS: Dict[str, Dict[str, Any]] = {
@@ -111,12 +121,55 @@ def _xai_headers(api_key: str) -> Dict[str, str]:
     }
 
 
+# Fallback for mime types stdlib doesn't recognise on every Windows install
+# (mkv is the common offender). Anything not in stdlib AND not here falls
+# back to application/octet-stream.
+_EXTRA_MIME_FALLBACKS: Dict[str, str] = {".mkv": "video/x-matroska"}
+
+
+def _maybe_local_to_data_url(value: str) -> str:
+    """Convert a local filesystem path to a base64 ``data:`` URL.
+
+    xAI's video endpoints accept public HTTPS URLs and base64 ``data:``
+    URIs but cannot resolve filesystem paths like ``C:\\Users\\...\\foo.png``.
+    Inline the bytes so xAI can ingest cache paths without us hosting a
+    public URL. Non-local inputs (http(s)://, data:) pass through unchanged.
+    """
+    if not value:
+        return value
+    lowered = value.lower()
+    if lowered.startswith(("http://", "https://", "data:")):
+        return value
+    candidate_paths = [value]
+    if lowered.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+        candidate_paths.append(unquote(urlparse(value).path).lstrip("/"))
+    for cand in candidate_paths:
+        try:
+            if not os.path.isfile(cand):
+                continue
+            mime = (
+                mimetypes.guess_type(cand)[0]
+                or _EXTRA_MIME_FALLBACKS.get(os.path.splitext(cand)[1].lower())
+                or "application/octet-stream"
+            )
+            with open(cand, "rb") as fh:
+                raw = fh.read()
+            encoded = base64.b64encode(raw).decode("ascii")
+            del raw  # release ~50MB MP4 buffer before f-string allocs again
+            return f"data:{mime};base64,{encoded}"
+        except OSError:
+            continue
+    # Not a recognised local file; let xAI reject it with its own error.
+    return value
+
+
 def _normalize_reference_images(reference_image_urls: Optional[List[str]]):
     refs = []
     for url in reference_image_urls or []:
         normalized = (url or "").strip()
         if normalized:
-            refs.append({"url": normalized})
+            refs.append({"url": _maybe_local_to_data_url(normalized)})
     return refs or None
 
 
@@ -131,20 +184,26 @@ def _clamp_duration(duration: Optional[int], has_reference_images: bool) -> int:
     return value
 
 
-async def _submit(
+async def _submit_to(
     client: httpx.AsyncClient,
+    endpoint_path: str,
     payload: Dict[str, Any],
     *,
     api_key: str,
     base_url: str,
 ) -> str:
-    """POST to /videos/generations — xAI's only public endpoint for our
-    text-to-video and image-to-video surface."""
+    """POST a video-generation-style payload to ``<base_url><endpoint_path>``.
+
+    Shared between the text/image-to-video ``/videos/generations`` path
+    and the continuation ``/videos/extensions`` path — both return
+    ``{"request_id": ...}`` synchronously and the result is polled via
+    :func:`_poll` on the same ``/videos/{request_id}`` endpoint.
+    """
     response = await client.post(
-        f"{base_url}/videos/generations",
+        f"{base_url}{endpoint_path}",
         headers={**_xai_headers(api_key), "x-idempotency-key": str(uuid.uuid4())},
         json=payload,
-        timeout=60,
+        timeout=120,
     )
     response.raise_for_status()
     body = response.json()
@@ -152,6 +211,55 @@ async def _submit(
     if not request_id:
         raise RuntimeError("xAI video response did not include request_id")
     return request_id
+
+
+async def _submit_extension(
+    client: httpx.AsyncClient,
+    payload: Dict[str, Any],
+    *,
+    api_key: str,
+    base_url: str,
+) -> str:
+    """POST to /videos/extensions — xAI's video continuation endpoint."""
+    return await _submit_to(
+        client, "/videos/extensions", payload,
+        api_key=api_key, base_url=base_url,
+    )
+
+
+def _run_async(coro):
+    """Sync wrapper around an asyncio coroutine for plugin entry points.
+
+    The base provider API is sync (the agent calls ``provider.generate(...)``
+    / ``provider.extend(...)``), but xAI's submit/poll/download flow is
+    naturally async. Shared loop lifecycle keeps the two entry points
+    byte-identical.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+async def _download_to_cache(
+    client: httpx.AsyncClient, url: str, api_key: str,
+) -> Optional[str]:
+    """Bearer-auth GET an xAI CDN video URL, persist to the shared video cache.
+
+    The vidgen.x.ai CDN URL is short-lived and requires the OAuth bearer to
+    GET — platforms (Dingtalk, Telegram) that fetch it without auth receive
+    an HTML error page instead of MP4 bytes. Caching locally lets the
+    gateway hand the platform a filesystem path. Returns the absolute path,
+    or None when the download fails (caller falls back to surfacing the URL).
+    """
+    try:
+        r = await client.get(url, headers={"Authorization": f"Bearer {api_key}"})
+        r.raise_for_status()
+        return str(save_bytes_video(r.content))
+    except Exception as exc:
+        logger.warning("xAI video CDN download failed: %s", exc)
+        return None
 
 
 async def _poll(
@@ -237,6 +345,8 @@ class XAIVideoGenProvider(VideoGenProvider):
             "supports_audio": False,
             "supports_negative_prompt": False,
             "max_reference_images": MAX_REFERENCE_IMAGES,
+            "supports_extend": True,
+            "max_extend_duration": MAX_EXTEND_DURATION,
         }
 
     def generate(
@@ -255,25 +365,21 @@ class XAIVideoGenProvider(VideoGenProvider):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         try:
-            loop = asyncio.new_event_loop()
-            try:
-                return loop.run_until_complete(self._generate_async(
-                    prompt=prompt,
-                    model=model,
-                    image_url=image_url,
-                    reference_image_urls=reference_image_urls,
-                    duration=duration,
-                    aspect_ratio=aspect_ratio,
-                    resolution=resolution,
-                ))
-            finally:
-                loop.close()
+            return _run_async(self._generate_async(
+                prompt=prompt,
+                model=model,
+                image_url=image_url,
+                reference_image_urls=reference_image_urls,
+                duration=duration,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+            ))
         except Exception as exc:
             logger.warning("xAI video gen unexpected failure: %s", exc, exc_info=True)
             return error_response(
                 error=f"xAI video generation failed: {exc}",
                 error_type="api_error",
-                provider="xai",
+                provider=self.name,
                 model=model or DEFAULT_MODEL,
                 prompt=prompt,
                 aspect_ratio=aspect_ratio,
@@ -304,6 +410,8 @@ class XAIVideoGenProvider(VideoGenProvider):
 
         prompt = (prompt or "").strip()
         image_url_norm = (image_url or "").strip() or None
+        if image_url_norm:
+            image_url_norm = _maybe_local_to_data_url(image_url_norm)
         normalized_aspect_ratio = (aspect_ratio or DEFAULT_ASPECT_RATIO).strip()
         normalized_resolution = (resolution or DEFAULT_RESOLUTION).strip().lower()
         modality_used = "image" if image_url_norm else "text"
@@ -351,10 +459,12 @@ class XAIVideoGenProvider(VideoGenProvider):
         if refs:
             payload["reference_images"] = refs
 
-        async with httpx.AsyncClient() as client:
+        # 120s timeout covers POST submit with multi-MB base64 image bodies.
+        async with httpx.AsyncClient(timeout=120) as client:
             try:
-                request_id = await _submit(
-                    client, payload, api_key=api_key, base_url=base_url
+                request_id = await _submit_to(
+                    client, "/videos/generations", payload,
+                    api_key=api_key, base_url=base_url,
                 )
             except httpx.HTTPStatusError as exc:
                 detail = ""
@@ -365,7 +475,7 @@ class XAIVideoGenProvider(VideoGenProvider):
                 return error_response(
                     error=f"xAI submit failed ({exc.response.status_code}): {detail or exc}",
                     error_type="api_error",
-                    provider="xai",
+                    provider=self.name,
                     model=model or DEFAULT_MODEL,
                     prompt=prompt,
                 )
@@ -377,42 +487,44 @@ class XAIVideoGenProvider(VideoGenProvider):
                 poll_interval=DEFAULT_POLL_INTERVAL_SECONDS,
             )
 
-        status = poll_result["status"]
-        body = poll_result["body"]
+            status = poll_result["status"]
+            body = poll_result["body"]
 
-        if status == "done":
-            video = body.get("video") or {}
-            url = video.get("url")
-            if not url:
-                return error_response(
-                    error="xAI video generation completed without a video URL",
-                    error_type="empty_response",
-                    provider="xai",
+            if status == "done":
+                video = body.get("video") or {}
+                url = video.get("url")
+                if not url:
+                    return error_response(
+                        error="xAI video generation completed without a video URL",
+                        error_type="empty_response",
+                        provider=self.name,
+                        model=body.get("model") or model or DEFAULT_MODEL,
+                        prompt=prompt,
+                    )
+                local_path = await _download_to_cache(client, url, api_key)
+                extra: Dict[str, Any] = {
+                    "request_id": request_id,
+                    "resolution": normalized_resolution,
+                    "source_url": url,
+                }
+                if body.get("usage"):
+                    extra["usage"] = body["usage"]
+                return success_response(
+                    video=local_path or url,
                     model=body.get("model") or model or DEFAULT_MODEL,
                     prompt=prompt,
+                    modality=modality_used,
+                    aspect_ratio=normalized_aspect_ratio,
+                    duration=video.get("duration") or clamped_duration,
+                    provider=self.name,
+                    extra=extra,
                 )
-            extra: Dict[str, Any] = {
-                "request_id": request_id,
-                "resolution": normalized_resolution,
-            }
-            if body.get("usage"):
-                extra["usage"] = body["usage"]
-            return success_response(
-                video=url,
-                model=body.get("model") or model or DEFAULT_MODEL,
-                prompt=prompt,
-                modality=modality_used,
-                aspect_ratio=normalized_aspect_ratio,
-                duration=video.get("duration") or clamped_duration,
-                provider="xai",
-                extra=extra,
-            )
 
         if status == "timeout":
             return error_response(
                 error=f"Timed out waiting for video generation after {DEFAULT_TIMEOUT_SECONDS}s",
                 error_type="timeout",
-                provider="xai",
+                provider=self.name,
                 model=model or DEFAULT_MODEL,
                 prompt=prompt,
             )
@@ -425,7 +537,171 @@ class XAIVideoGenProvider(VideoGenProvider):
         return error_response(
             error=message,
             error_type=f"xai_{status}",
-            provider="xai",
+            provider=self.name,
+            model=model or DEFAULT_MODEL,
+            prompt=prompt,
+        )
+
+    def extend(
+        self,
+        prompt: str,
+        *,
+        video_url: str,
+        model: Optional[str] = None,
+        duration: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Extend an existing video via xAI ``/v1/videos/extensions``.
+
+        xAI returns the **full concatenated** result (source + new
+        continuation) as a single MP4.
+        """
+        try:
+            return _run_async(self._extend_async(
+                prompt=prompt,
+                video_url=video_url,
+                model=model,
+                duration=duration,
+            ))
+        except Exception as exc:
+            logger.warning("xAI video extend unexpected failure: %s", exc, exc_info=True)
+            return error_response(
+                error=f"xAI video extension failed: {exc}",
+                error_type="api_error",
+                provider=self.name,
+                model=model or DEFAULT_MODEL,
+                prompt=prompt,
+            )
+
+    async def _extend_async(
+        self,
+        *,
+        prompt: str,
+        video_url: str,
+        model: Optional[str],
+        duration: Optional[int],
+    ) -> Dict[str, Any]:
+        api_key, base_url = _resolve_xai_credentials()
+        if not api_key:
+            return error_response(
+                error=(
+                    "No xAI credentials found. Sign in via `hermes auth add xai-oauth` "
+                    "(SuperGrok subscription) or set XAI_API_KEY from "
+                    "https://console.x.ai/."
+                ),
+                error_type="auth_required",
+                provider="xai", prompt=prompt,
+            )
+
+        # prompt + video_url presence are guaranteed by the tool layer
+        # (_handle_video_extend); only validate provider-specific constraints.
+        source_ref = _maybe_local_to_data_url((video_url or "").strip())
+
+        # xAI's extensions endpoint documents 6 or 10 seconds; clamp.
+        requested = duration if duration is not None else DEFAULT_EXTEND_DURATION
+        if requested not in VALID_EXTEND_DURATIONS:
+            requested = min(
+                VALID_EXTEND_DURATIONS,
+                key=lambda v: abs(v - int(requested)),
+            )
+
+        payload: Dict[str, Any] = {
+            "model": model or DEFAULT_MODEL,
+            "prompt": (prompt or "").strip(),
+            "video": {"url": source_ref},
+            "duration": requested,
+        }
+
+        # 120s timeout covers POST submit with multi-MB base64 video bodies.
+        async with httpx.AsyncClient(timeout=120) as client:
+            try:
+                request_id = await _submit_extension(
+                    client, payload, api_key=api_key, base_url=base_url,
+                )
+            except httpx.HTTPStatusError as exc:
+                detail = ""
+                try:
+                    detail = exc.response.text[:500]
+                except Exception:
+                    pass
+                return error_response(
+                    error=f"xAI extension submit failed ({exc.response.status_code}): {detail or exc}",
+                    error_type="api_error",
+                    provider=self.name,
+                    model=model or DEFAULT_MODEL,
+                    prompt=prompt,
+                )
+
+            poll_result = await _poll(
+                client, request_id,
+                api_key=api_key, base_url=base_url,
+                timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+                poll_interval=DEFAULT_POLL_INTERVAL_SECONDS,
+            )
+
+            status = poll_result["status"]
+            body = poll_result["body"]
+
+            if status == "done":
+                video = body.get("video") or {}
+                url = video.get("url")
+                if not url:
+                    return error_response(
+                        error="xAI video extension completed without a video URL",
+                        error_type="empty_response",
+                        provider=self.name,
+                        model=body.get("model") or model or DEFAULT_MODEL,
+                        prompt=prompt,
+                    )
+                local_path = await _download_to_cache(client, url, api_key)
+                extra: Dict[str, Any] = {
+                    "request_id": request_id,
+                    "operation": "extend",
+                    "extend_seconds_requested": requested,
+                    "source_url": url,
+                    # xAI's response carries the source clip's mvhd duration,
+                    # not the total post-concat length, so we surface 0 in
+                    # the typed field and let the caller mvhd-parse the
+                    # downloaded mp4 if it really needs the number.
+                    "duration_unreliable": True,
+                }
+                if body.get("usage"):
+                    extra["usage"] = body["usage"]
+                return success_response(
+                    video=local_path or url,
+                    model=body.get("model") or model or DEFAULT_MODEL,
+                    prompt=prompt,
+                    modality="video",
+                    aspect_ratio="",
+                    duration=0,
+                    provider=self.name,
+                    extra=extra,
+                )
+
+        if status == "timeout":
+            return error_response(
+                error=f"Timed out waiting for video extension after {DEFAULT_TIMEOUT_SECONDS}s",
+                error_type="timeout",
+                provider=self.name,
+                model=model or DEFAULT_MODEL,
+                prompt=prompt,
+            )
+
+        message = (
+            (body.get("error", {}) or {}).get("message")
+            or body.get("message")
+            or body.get("error")
+            or f"xAI video extension ended with status '{status}'"
+        )
+        # Surface moderation rejections clearly so the agent can adjust prompt.
+        err_type = f"xai_{status}"
+        if isinstance(body, dict) and body.get("block_reason"):
+            err_type = "content_moderation"
+            message = f"{message} (block_reason={body['block_reason']})"
+        return error_response(
+            error=message,
+            error_type=err_type,
+            provider=self.name,
             model=model or DEFAULT_MODEL,
             prompt=prompt,
         )

@@ -36,7 +36,10 @@ All providers return a dict built by :func:`success_response` /
     video           str | None      URL or absolute file path
     model           str             provider-specific model identifier
     prompt          str             echoed prompt
-    modality        str             "text" | "image" (which mode was used)
+    modality        str             "text" | "image" | "video"
+                                    "text"  — text-to-video generation
+                                    "image" — image-to-video generation
+                                    "video" — video-to-video (extension)
     aspect_ratio    str             provider-native (e.g. "16:9") or ""
     duration        int             seconds (0 if not applicable)
     provider        str             provider name (for diagnostics)
@@ -149,10 +152,12 @@ class VideoGenProvider(abc.ABC):
                 "supports_audio": True,
                 "supports_negative_prompt": True,
                 "max_reference_images": 7,
+                "supports_extend": True,              # video continuation from a source mp4
+                "max_extend_duration": 10,            # seconds added per extend call
             }
 
         Used by the tool layer for soft validation and by ``hermes tools``
-        for the picker. Default: text-only.
+        for the picker. Default: text-only, no extend.
         """
         return {
             "modalities": ["text"],
@@ -163,7 +168,46 @@ class VideoGenProvider(abc.ABC):
             "supports_audio": False,
             "supports_negative_prompt": False,
             "max_reference_images": 0,
+            "supports_extend": False,
+            "max_extend_duration": 0,
         }
+
+    def extend(
+        self,
+        prompt: str,
+        *,
+        video_url: str,
+        model: Optional[str] = None,
+        duration: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Extend an existing video by appending new footage continuing its last frame.
+
+        Optional capability — providers that don't expose a continuation
+        endpoint should leave this default in place. The tool layer reads
+        :meth:`capabilities`'s ``supports_extend`` flag and never dispatches
+        here when False, but a defensive ``error_response`` is returned in
+        case a caller bypasses that check.
+
+        ``video_url`` accepts either a public HTTPS URL, a base64 ``data:``
+        URI, or a local filesystem path; provider implementations are
+        responsible for whichever conversions their endpoint needs.
+
+        Implementations should return the dict from :func:`success_response`
+        with the **full concatenated** video (source + continuation) in
+        ``video``; the duration field should reflect the total length, not
+        the appended segment.
+        """
+        return error_response(
+            error=(
+                f"Provider '{self.name}' does not support video extension. "
+                f"Pick a backend whose capabilities() reports supports_extend=True."
+            ),
+            error_type="not_supported",
+            provider=self.name,
+            model=model or "",
+            prompt=prompt,
+        )
 
     @abc.abstractmethod
     def generate(
