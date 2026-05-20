@@ -402,6 +402,13 @@ def _run_review_in_thread(
                 credential_pool=getattr(agent, "_credential_pool", None),
                 parent_session_id=agent.session_id,
                 skip_memory=True,
+                # Constrain the review fork's tool *schema* (not just the
+                # call-time whitelist below) so providers with strict
+                # per-request tool limits (xAI: 200) don't 400 on the
+                # outbound request. The review only needs memory/skills
+                # tools; the larger main-agent toolset would be ignored
+                # by the whitelist anyway.
+                enabled_toolsets=["memory", "skills"],
             )
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
